@@ -1,0 +1,506 @@
+---
+title: "class_scheme"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F, cache = T, warning = F, message = F, error = F)
+
+library(tidyverse)
+library(foreign)
+library(splitstackshape)
+#library(Zelig)
+library(stats)
+library(outliers)
+library(rgdal)
+library(sf)
+library(matrixStats)
+library(scales)
+library(DescTools)
+library(interactions)
+library(Hmisc)
+library(sandwich)
+library(spgwr)
+library(raster)
+library(rgeos)
+library(rgdal)
+library(mipfp)
+library(ipfp)
+library(osmdata)
+library(readxl)
+
+mutate <- dplyr::mutate
+select <- dplyr::select
+filter <- dplyr::filter
+rename <- dplyr::rename
+distinct <- dplyr::distinct
+pull <- dplyr::pull
+summarise <- dplyr::summarise
+```
+
+```{r class_lon}
+
+lon <- read.csv("Cities/London/Data_AGE_ECOACT_ETHGRP_OCCUP_UNIT.csv") %>%
+  mutate_all(as.character) %>%
+  mutate_at(c("F360203","F360208","F360207","F360209","F360210","F360212","F360217","F360216","F360218","F360219","F360221","F360226","F360225","F360227","F360228","F360230","F360235","F360234","F360236","F360237","F360239","F360244","F360243","F360245","F360246","F360248","F360253","F360252","F360254","F360255","F360257","F360262", "F360261","F360263","F360264","F360266","F360271","F360270","F360272","F360273","F360275","F360280", "F360279","F360281","F360282"),as.numeric) %>%
+  mutate(white1 = F360203, #white
+         black1 = F360209, #black,african,caribbean
+         other1 = F360207+F360208+F360210, #asian,mixed,other
+         white2 = F360212,
+         black2 = F360218,
+         other2 = F360216+F360217+F360219,
+         white3 = F360221,
+         black3 = F360227,
+         other3 = F360225+F360226+F360228,
+         white4 = F360230,
+         black4 = F360236,
+         other4 = F360234+F360235+F360237,
+         white5 = F360239,
+         black5 = F360245,
+         other5 = F360243+F360244+F360246,
+         white6 = F360248,
+         black6 = F360254,
+         other6 = F360252+F360253+F360255,
+         white7 = F360257,
+         black7 = F360263,
+         other7 = F360261+F360262+F360264,
+         white8 = F360266,
+         black8 = F360272,
+         other8 = F360270+F360271,+F360273,
+         white9 = F360275,
+         black9 = F360281,
+         other9 = F360280+F360279+F360282) %>%
+  select(GEO_CODE,white1,black1,other1,white2,black2,other2,white3,black3,other3,white4,black4,other4,white5,black5,other5,white6,black6,other6,white7,black7,other7,white8,black8,other8,white9,black9,other9)
+
+lon %>% saveRDS("Cities/London/lon_soc_lsoa.rds")
+
+```
+
+```{r class_nyc}
+
+data <- read.dta("Cities/NYC/usa_00003.dta") %>% filter(us2018a_st == 36)
+
+isco_soc <- read.csv("Inputs/Class_Classification/ISCO_SOC.csv") %>% mutate_all(as.character)
+soc_isco <-  read_xls("Inputs/Class_Classification/ISCO_SOC_Crosswalk.xls") %>% slice(7:nrow(.)) %>% mutate_all(as.character)
+colnames(soc_isco) <- c("ISCO_Code","ISCO_Title","v1","SOC_Code","SOC_Title","v2")
+soc_isco <- soc_isco %>% select(ISCO_Code,SOC_Code)
+soc_isco$SOC_Code <- gsub("-","",soc_isco$SOC_Code)
+
+oc <- data %>%
+  left_join(soc_isco, by=c("us2018a_socp"="SOC_Code")) %>%
+  left_join(isco_soc, by=c("ISCO_Code"="ISCO08")) %>%
+    mutate(class = substr(SOC.2020,1,1)) %>%
+    mutate(color = case_when(us2018a_rac1p %in% c(1) ~ "white", #white
+                             us2018a_rac1p %in% c(2) ~ "black", #black
+                             us2018a_rac1p %in% c(3,4,5,6,7,8,9) ~ "other")) #indian,alaska,asian,hawaiian,other,mixed
+
+
+#### Population synthesis - occupational groups considering race and income ####
+
+int_trs <- function(x){
+  xv <- as.vector(x)
+  xint <- floor(xv)
+  r <- xv - xint
+  def <- round(sum(r))
+  topup <- sample(length(x), size = def, prob = r)
+  xint[topup] <- xint[topup] + 1
+  dim(xint) <- dim(x)
+  dimnames(xint) <- dimnames(x)
+  xint
+}
+
+
+ct_shp <- st_read("Cities/NYC/nyc_censustracts.shp") %>%
+  mutate(ct2010 = paste0(STATE,COUNTY,ct2010))
+
+puma_shp <- st_read("Cities/NYC/ipums_puma_2010.shp") %>%
+  filter(STATEFIP == "36") %>%
+  mutate(PUMA = substr(PUMA,2,10)) %>%
+  filter(PUMA %in% ct_shp$puma)
+
+# Aggregated data
+ct <- read_csv("Cities/NYC/PER_Public.csv") %>%
+  left_join(read_csv("Cities/NYC/HH_Public.csv"),by=c("SAMPN"))  %>%
+  filter(CTFIP %in% c("36005","36061","36047","36081","36085")) %>%
+  group_by(SAMPN,PSAMP) %>%
+  mutate(index = seq(1,n(),1)) %>%
+  filter(index == 1) %>%
+  ungroup() %>%
+  select(CTFIP,HTRACT,INCOM,RACE,HH_WHT2.x) %>%
+  filter(INCOM != 99) %>%
+  mutate(INCOM = paste0("inc",INCOM)) %>%
+  mutate(RACE = case_when(RACE %in% c("White" ) ~ "white", #white
+                          RACE %in% c("African American, Black" ) ~ "black", #black
+                          RACE %in% c("Asian","Multiracial","Hispanic/Mexican","American Indian, Alaskan Native","Pacific Islander","Other (Specify)") ~ "other")) %>% #asian,indian,alaskan,pacific,multiracial,other
+  mutate(inc1 = ifelse(INCOM == "inc1",HH_WHT2.x,0),
+         inc2 = ifelse(INCOM == "inc2",HH_WHT2.x,0),
+         inc3 = ifelse(INCOM == "inc3",HH_WHT2.x,0),
+         inc4 = ifelse(INCOM == "inc4",HH_WHT2.x,0),
+         inc5 = ifelse(INCOM == "inc5",HH_WHT2.x,0),
+         inc6 = ifelse(INCOM == "inc6",HH_WHT2.x,0),
+         inc7 = ifelse(INCOM == "inc7",HH_WHT2.x,0),
+         inc8 = ifelse(INCOM == "inc8",HH_WHT2.x,0),
+         white = ifelse(RACE == "white",HH_WHT2.x,0),
+         black = ifelse(RACE == "black",HH_WHT2.x,0),
+         other = ifelse(RACE == "other",HH_WHT2.x,0)) %>%
+  select(-c(RACE,INCOM,HH_WHT2.x,CTFIP)) %>%
+  rename("O_TRACT" = HTRACT) %>%
+  group_by(O_TRACT) %>%
+  summarise_all(.,~(p=sum(.,na.rm = T))) %>%
+  mutate(O_TRACT = as.character(O_TRACT)) %>%
+  left_join(ct_shp %>% st_drop_geometry() %>% select(ct2010,puma),by=c("O_TRACT"="ct2010"))
+  
+
+# Individual data
+wa <- oc %>%
+  mutate(puma = substr(us2018a_puma,2,10)) %>%
+  filter(puma %in% ct_shp$puma) %>%
+  mutate(ftotinc = as.numeric(as.character(ftotinc))) %>%
+  filter(ftotinc > 0 & ftotinc < 9999998) %>%
+  mutate(income = case_when(ftotinc > 0 & ftotinc <= 15000 ~ "inc1",
+                            ftotinc > 15000 & ftotinc<= 29999 ~ "inc2",
+                            ftotinc > 29999 & ftotinc<= 49999 ~ "inc3",
+                            ftotinc > 49999 & ftotinc<= 74999 ~ "inc4",
+                            ftotinc > 74999 & ftotinc<= 99999 ~ "inc5",
+                            ftotinc > 99999 & ftotinc<= 149999 ~ "inc6",
+                            ftotinc > 149999 & ftotinc <= 199999 ~ "inc7",
+                            ftotinc > 199999 ~ "inc8")) %>%
+  rename("weight" = perwt) %>%
+  select(puma,income,color,weight,class) %>%
+  filter(!is.na(color)) %>%
+  mutate(id = row_number()) %>%
+  filter(!is.na(class)) %>%
+  filter(!is.na(income))
+
+# Get all unique ap codes
+cod_ap <- unique(wa$puma)
+
+pop_sint <- function(i){
+  
+  print(i)
+  
+  # Filter data from only selected weighting area code
+  wa_cor <- wa %>% filter(puma == i) %>% ungroup()
+  ct_cor <- ct %>% filter(puma == i) %>% ungroup()
+  
+  # Population retification based on census tracts
+  aux <- wa_cor %>% filter(color == "white") 
+  cor <- sum(ct_cor$white,na.rm=T)/sum(aux$weight,na.rm=T)
+  wa_wh <- aux %>% mutate(weight = weight * cor)
+  aux <- wa_cor %>% filter(color == "black")
+  cor <- sum(ct_cor$black,na.rm=T)/sum(aux$weight,na.rm=T)
+  wa_bl <- aux %>% mutate(weight = weight * cor)
+  aux <- wa_cor %>% filter(color == "other")
+  cor <- sum(ct_cor$other,na.rm=T)/sum(aux$weight,na.rm=T)
+  wa_ot <- aux %>% mutate(weight = weight * cor)
+  wa_cor <- rbind(wa_wh,wa_bl,wa_ot)
+  aux <- as.data.frame(cbind(rep(i,24),
+                           seq(nrow(wa_cor)+1,nrow(wa_cor)+24,1),
+                           rep(c("inc1","inc2","inc3","inc4","inc5","inc6","inc7","inc8"),each=3),
+                           rep(c("white","black","other"),8),
+                           rep(1,24),
+                           rep(NA,24)))
+colnames(aux) <- c("puma","id","income","color","weight","class")
+wa_cor <- rbind(wa_cor,aux) %>%
+  mutate(weight = as.numeric(weight))
+  
+  # Prepare individual data (ap)
+  ind_orig <- wa_cor
+  ind_orig$weight <- int_trs(ind_orig$weight)
+  ind <- expandRows(ind_orig,"weight") %>% mutate(id_2 = paste0(id,"-",row.names(.))) %>%
+    select(-puma,-class)
+  row.names(ind) <- ind$id_2
+  ind <- ind %>% select(-id,-id_2)
+  
+  # Prepare aggregated data (sc)
+  con_inc <- ct_cor %>% select(O_TRACT,inc1,inc2,inc3,inc4,inc5,inc6,inc7,inc8) %>%
+    column_to_rownames(var = "O_TRACT")
+  con_col <- ct_cor %>% select(O_TRACT,white,black,other) %>%
+    column_to_rownames(var = "O_TRACT")
+  cons <- cbind(con_inc,con_col)
+  
+  # Constraints categories
+  cat_inc <- model.matrix(~ ind$income - 1)
+  cat_col <- model.matrix(~ ind$color - 1)[, c(3,1,2)]
+  ind_cat <- cbind(cat_inc, cat_col)
+  ind_catt <- t(ind_cat)
+  cons <- apply(cons, 2, as.numeric)
+  
+  # Individual categories
+  n_ind <- nrow(ind)
+  x0 <- rep(1, n_ind)
+  
+  # IPF algorithm
+  weights <- apply(cons, MARGIN = 1, FUN = function(x) ipfp(x, ind_catt, x0, maxit = 20))
+  
+  # Nominate results
+  colnames(weights) <- row.names(con_inc)
+  row.names(weights) <- row.names(ind)
+  weights <- as.data.frame(weights)
+  
+  # Get occupational groups based on income and race data
+  weights <- weights %>%
+    mutate(id = str_extract(row.names(.),"\\d{1,10}-"),
+           id = substr(id,1,nchar(id)-1)) %>%
+    left_join(ind_orig %>% mutate(id = as.character(id)), by = "id") %>%
+    select(-puma,-income,-id) %>%
+    group_by(color,class) %>%
+    summarise_all(.,~sum(.,na.rm=T)) %>%
+    mutate(key = paste0(color,class)) %>%
+    group_by(key) %>%
+    select(-class,-color) %>%
+    summarise_all(.,~sum(.,na.rm=T)) %>%
+    t()
+  colnames(weights) <- weights[1,]
+  weights <- weights[-1,]
+  weights <- weights %>% as.data.frame() %>%
+    mutate(O_TRACT = row.names(weights),puma = i)}
+
+nyc <- cod_ap %>% map_df(pop_sint) %>%
+  select(-whiteNA,-blackNA,-otherNA)
+
+
+nyc %>% saveRDS("Cities/NYC/nyc_soc_ct.rds")
+```
+
+```{r class_sp}
+
+var_isco <- read.csv("Inputs/Class_Classification/cod_ISCO_EGP.csv", sep=";")[,1:2] %>%
+  mutate_all(as.character)
+colnames(var_isco) <- c("V6461","ISCO08")
+
+isco_soc <- read.csv("Inputs/Class_Classification/ISCO_SOC.csv") %>% mutate_all(as.character)
+
+dados <- readRDS("Temporary/sp_egp_wa_MR.rds") %>% 
+    mutate(CD_GEOCODI = paste0(as.character(V0001),as.character(V0002))) %>%
+    left_join(var_isco, by="V6461") %>%
+  left_join(isco_soc, by="ISCO08") %>%
+   mutate(class = substr(SOC.2020,1,1),
+           color = case_when(V0606 %in% c("1") ~ "white", #branca
+                             V0606 %in% c("2","4") ~ "black", #preta,parda
+                             V0606 %in% c("3","5","9") ~ "other")) #amarela,indigena,ignorado
+
+#### Population synthesis - occupational groups considering race and income ####
+
+int_trs <- function(x){
+  xv <- as.vector(x)
+  xint <- floor(xv)
+  r <- xv - xint
+  def <- round(sum(r))
+  topup <- sample(length(x), size = def, prob = r)
+  xint[topup] <- xint[topup] + 1
+  dim(xint) <- dim(x)
+  dimnames(xint) <- dimnames(x)
+  xint
+}
+
+# Aggregated data
+ct <- read.csv("Inputs/Census_Universe/SP/CSV/PessoaRenda_SP.csv", sep=";") %>%
+  mutate_all(~na_if(.,"X")) %>%
+  mutate_all(as.character) %>%
+  mutate_all(as.numeric) %>%
+  mutate(CD_GEOCODI = as.character(Cod_setor)) %>%
+  select(CD_GEOCODI,V001,V002,V003,V004,V005,V006,V007,V008,V009,V010) %>%
+  left_join(read.csv("Inputs/Census_Universe/SP/CSV/Pessoa03_SP.csv",sep=";") %>%
+              mutate_all(~na_if(.,"X")) %>%
+              mutate_all(as.character) %>%
+              mutate_all(as.numeric) %>%
+              mutate(CD_GEOCODI = as.character(Cod_setor),
+                     white = V002 - V007- V012,
+                     black = V003 + V005 - V008 - V013 - V010 - V015,
+                     other = V004 + V006 - V009 - V011 - V014 - V016) %>%
+              select(CD_GEOCODI,white,black,other), by = "CD_GEOCODI") %>%
+  mutate(income = V001 + V002 + V003 + V004 + V005 + V006 + V007 + V008 + V009 + V010,
+         people = white + black + other,
+         conf = income == people) %>%
+  mutate(V010 = ifelse(conf == "FALSE",V010 - (income - people),V010)) %>%
+  select(-conf,-income,people) %>%
+  rename("inc1"=V001,"inc2"=V002,"inc3"=V003,"inc4"=V004,"inc5"=V005,
+         "inc6"=V006,"inc7"=V007,"inc8"=V008,"inc9"=V009,"inc0"=V010) %>%
+  left_join(read.csv("Inputs/Census_Sample/sc_ap_2010.csv",sep=";",colClasses = "character"),by="CD_GEOCODI") %>%
+  filter(!is.na(white)) %>%
+  filter(people != 0)
+
+# Individual data
+wa <- dados %>%
+  mutate(V0011 = as.character(V0011)) %>%
+  rename("age" = V6036,"income_MW" = V6526,"CD_GEOCODAP" = V0011,"weight"=V0010) %>%
+  filter(age >= 10) %>%
+  mutate(income = case_when(income_MW > 0 & income_MW <= 0.5 ~ "inc1",
+                            income_MW > 0.5 & income_MW <= 1 ~ "inc2",
+                            income_MW > 1 & income_MW <= 2 ~ "inc3",
+                            income_MW > 2 & income_MW <= 3 ~ "inc4",
+                            income_MW > 3 & income_MW <= 5 ~ "inc5",
+                            income_MW > 5 & income_MW <= 10 ~ "inc6",
+                            income_MW > 10 & income_MW <= 15 ~ "inc7",
+                            income_MW > 15 & income_MW <= 20 ~ "inc8",
+                            income_MW >= 20 ~ "inc9",
+                            income_MW == 0 | is.na(income_MW) ~ "inc0")) %>%
+  select(CD_GEOCODAP,income,color,weight,class) %>%
+  filter(!is.na(color)) %>%
+  mutate(id = row_number()) %>%
+  filter(!is.na(class))%>%
+  filter(!is.na(income))
+
+# Get all unique ap codes
+cod_ap <- unique(wa$CD_GEOCODAP)
+
+pop_sint <- function(i){
+  
+   print(i)
+  
+  # Filter data from only selected weighting area code
+  wa_cor <- wa %>% filter(CD_GEOCODAP == i) %>% ungroup()
+  ct_cor <- ct %>% filter(CD_GEOCODAP == i) %>% ungroup()
+  
+  # Population retification based on census tracts
+  aux <- wa_cor %>% filter(color == "white") 
+  cor <- sum(ct_cor$white,na.rm=T)/sum(aux$weight,na.rm=T)
+  wa_wh <- aux %>% mutate(weight = weight * cor)
+  aux <- wa_cor %>% filter(color == "black")
+  cor <- sum(ct_cor$black,na.rm=T)/sum(aux$weight,na.rm=T)
+  wa_bl <- aux %>% mutate(weight = weight * cor)
+  aux <- wa_cor %>% filter(color == "other")
+  cor <- sum(ct_cor$other,na.rm=T)/sum(aux$weight,na.rm=T)
+  wa_ot <- aux %>% mutate(weight = weight * cor)
+  wa_cor <- rbind(wa_wh,wa_bl,wa_ot)
+  aux <- as.data.frame(cbind(rep(cod_ap,each=30),
+                           seq(nrow(wa)+1,nrow(wa)+1+30*length(cod_ap),1),
+                           rep(rep(c("inc1","inc2","inc3","inc4","inc5","inc6","inc7","inc8","inc9","inc0"),each=3),length(cod_ap)),
+                           rep(c("white","black","other"),10*length(cod_ap)),
+                           rep(1,30*length(cod_ap)),
+                           rep(NA,30*length(cod_ap))))
+colnames(aux) <- c("CD_GEOCODAP","id","income","color","weight","class")
+wa_cor <- rbind(wa_cor,aux) %>%
+  mutate(weight = as.numeric(weight))
+  
+  # Prepare individual data (ap)
+  ind_orig <- wa_cor
+  ind_orig$weight <- int_trs(ind_orig$weight)
+  ind <- expandRows(ind_orig,"weight") %>% mutate(id_2 = paste0(id,"-",row.names(.))) %>%
+    select(-CD_GEOCODAP,-class)
+  row.names(ind) <- ind$id_2
+  ind <- ind %>% select(-id,-id_2)
+  
+  # Prepare aggregated data (sc)
+  con_inc <- ct_cor %>% select(CD_GEOCODI,inc0,inc1,inc2,inc3,inc4,inc5,inc6,inc7,inc8,inc9)
+  row.names(con_inc) <- con_inc$CD_GEOCODI
+  con_inc <- con_inc %>% select(-CD_GEOCODI)
+  con_col <- ct_cor %>% select(CD_GEOCODI,white,black,other)
+  row.names(con_col) <- con_col$CD_GEOCODI
+  con_col <- con_col %>% select(-CD_GEOCODI)
+  cons <- cbind(con_inc,con_col)
+  
+  # Constraints categories
+  cat_inc <- model.matrix(~ ind$income - 1)
+  cat_col <- model.matrix(~ ind$color - 1)[, c(3,1,2)]
+  ind_cat <- cbind(cat_inc, cat_col)
+  ind_catt <- t(ind_cat)
+  cons <- apply(cons, 2, as.numeric)
+  
+  # Individual categories
+  n_ind <- nrow(ind)
+  x0 <- rep(1, n_ind)
+  
+  # IPF algorithm
+  weights <- apply(cons, MARGIN = 1, FUN = function(x) ipfp(x, ind_catt, x0, maxit = 20))
+  
+  # Nominate results
+  colnames(weights) <- row.names(con_inc)
+  row.names(weights) <- row.names(ind)
+  weights <- as.data.frame(weights)
+  
+  # Get occupational groups based on income and race data
+  weights <- weights %>%
+    mutate(id = str_extract(row.names(.),"\\d{1,10}-"),
+           id = substr(id,1,nchar(id)-1)) %>%
+    left_join(ind_orig, by = "id") %>%
+    select(-CD_GEOCODAP,-income,-id) %>%
+    group_by(color,class) %>%
+    summarise_all(.,~sum(.,na.rm=T)) %>%
+    mutate(key = paste0(color,class)) %>%
+    group_by(key) %>%
+    select(-class,-color) %>%
+    summarise_all(.,~sum(.,na.rm=T)) %>%
+    t()
+  colnames(weights) <- weights[1,]
+  weights <- weights[-1,]
+  weights <- weights %>% as.data.frame() %>%
+    mutate(CD_GEOCODI = row.names(weights),CD_GEOCODAP = i)}
+
+sp <- cod_ap %>% map_df(pop_sint) %>%
+  select(-whiteNA,-blackNA,-otherNA )
+
+sp %>% saveRDS("Cities/Sao Paulo/sp_soc_sc.rds")
+
+```
+
+```{r income}
+
+#### SP
+var_isco <- read.csv("Inputs/Class_Classification/cod_ISCO_EGP.csv", sep=";")[,1:2] %>%
+  mutate_all(as.character)
+colnames(var_isco) <- c("V6461","ISCO08")
+
+isco_soc <- read.csv("Inputs/Class_Classification/ISCO_SOC.csv") %>% mutate_all(as.character)
+
+dados <- readRDS("Temporary/sp_egp_wa_MR.rds") %>% 
+    mutate(CD_GEOCODI = paste0(as.character(V0001),as.character(V0002))) %>%
+    left_join(var_isco, by="V6461") %>%
+  left_join(isco_soc, by="ISCO08") %>%
+   mutate(class = substr(SOC.2020,1,1),
+           color = case_when(V0606 %in% c("1","3") ~ "white",
+                             V0606 %in% c("2","4","5") ~ "black"))
+sp <- dados %>%
+  mutate(V0011 = as.character(V0011)) %>%
+  rename("age" = V6036,"income_MW" = V6526,"CD_GEOCODAP" = V0011,"weight"=V0010) %>%
+  filter(age >= 10) %>%
+  mutate(income = income_MW*510) %>%
+  select(CD_GEOCODAP,income,color,weight,class) %>%
+  filter(!is.na(class))
+
+#### NYC
+data <- read.dta("Cities/NYC/usa_00003.dta") %>% filter(us2018a_st == 36)
+
+isco_soc <- read.csv("Inputs/Class_Classification/ISCO_SOC.csv") %>% mutate_all(as.character)
+soc_isco <-  read_xls("Inputs/Class_Classification/ISCO_SOC_Crosswalk.xls") %>% slice(7:nrow(.)) %>% mutate_all(as.character)
+colnames(soc_isco) <- c("ISCO_Code","ISCO_Title","v1","SOC_Code","SOC_Title","v2")
+soc_isco <- soc_isco %>% select(ISCO_Code,SOC_Code)
+soc_isco$SOC_Code <- gsub("-","",soc_isco$SOC_Code)
+
+oc <- data %>%
+  left_join(soc_isco, by=c("us2018a_socp"="SOC_Code")) %>%
+  left_join(isco_soc, by=c("ISCO_Code"="ISCO08")) %>%
+    mutate(class = substr(SOC.2020,1,1)) %>%
+    mutate(color = case_when(us2018a_rac1p %in% c(1,6) ~ "white",
+                             us2018a_rac1p %in% c(2,3,4,5,7,8,9) ~ "black"))
+
+ct_shp <- st_read("Cities/NYC/nyc_censustracts.shp") %>%
+  mutate(ct2010 = paste0(STATE,COUNTY,ct2010))
+
+puma_shp <- st_read("Cities/NYC/ipums_puma_2010.shp") %>%
+  filter(STATEFIP == "36") %>%
+  mutate(PUMA = substr(PUMA,2,10)) %>%
+  filter(PUMA %in% ct_shp$puma)
+
+nyc <- oc %>%
+  mutate(puma = substr(us2018a_puma,2,10)) %>%
+  filter(puma %in% ct_shp$puma) %>%
+  mutate(inctot = as.numeric(as.character(inctot))) %>%
+  filter(inctot > 0 & inctot < 9999998) %>%
+  mutate(income = inctot/12) %>%
+  rename("weight" = perwt) %>%
+  select(puma,income,color,weight,class)%>%
+  filter(!is.na(class))
+
+
+sp %>% group_by(class) %>%
+  summarise(md_inc = weightedMedian(income,weight,na.rm=T),mn_inc = weighted.mean(income,weight,na.rm=T))
+nyc %>% group_by(class) %>%
+  summarise(md_inc = weightedMedian(income,weight,na.rm=T),mn_inc = weighted.mean(income,weight,na.rm=T))
+
+```
+
+
