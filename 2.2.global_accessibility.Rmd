@@ -1,0 +1,3709 @@
+---
+title: "Global_Accessibility"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r, include = F}
+
+knitr::opts_chunk$set(echo = F, cache = T, warning = F, message = F, error = F)
+
+library(tidyverse)
+library(foreign)
+library(splitstackshape)
+#library(Zelig)
+library(stats)
+library(outliers)
+library(rgdal)
+library(sf)
+library(matrixStats)
+library(scales)
+library(DescTools)
+library(interactions)
+library(Hmisc)
+library(sandwich)
+library(spgwr)
+library(ggsn)
+library(osmdata)
+library(viridis)
+
+mutate <- dplyr::mutate
+select <- dplyr::select
+filter <- dplyr::filter
+rename <- dplyr::rename
+distinct <- dplyr::distinct
+pull <- dplyr::pull
+summarize <- dplyr::summarize
+
+is_outlier <- function(x) {
+  return(x < quantile(x, 0.25) - 1.5 * IQR(x) | x > quantile(x, 0.75) + 1.5 * IQR(x))}
+
+```
+
+# 2-step
+
+```{r sp_access_2step}
+
+hx <- st_read("Cities/Sao Paulo/sp_hex1000_data_MR.shp") %>%
+  filter(pop >= 0) %>%
+  mutate(GEO_ID = as.character(GEO_ID)) %>%
+  filter(CD_GEOCODM == "3550308")
+
+# Jobs
+jobs <- read.dbf("Cities/Sao Paulo/Banco de Dados/OD_2017.dbf") %>% 
+  filter(MUNI_DOM == 36) %>%
+  filter(F_PESS == 1) %>%
+  filter(TRAB1_RE == 2) %>%
+  select(FE_PESS,CO_TR1_X,CO_TR1_Y) %>%
+  rename("X" = CO_TR1_X, "Y" = CO_TR1_Y) %>%
+  rbind(read.dbf("Cities/Sao Paulo/Banco de Dados/OD_2017.dbf") %>% 
+          filter(F_PESS == 1) %>%
+          filter(MUNI_DOM == 36) %>%
+          filter(TRAB2_RE == 2) %>%
+          select(FE_PESS,CO_TR2_X,CO_TR2_Y) %>%
+          rename("X" = CO_TR2_X, "Y" = CO_TR2_Y)) %>%
+  na.omit() %>%
+  st_as_sf(coords=c("X","Y"),remove=F,crs=22523) %>%
+  st_transform(4326) %>%
+  st_join(hx,join=st_within) %>%
+  st_drop_geometry() %>%
+  group_by(GEO_ID) %>%
+  summarise(jobs = sum(FE_PESS,na.rm=T))
+
+# Income
+socio <- read.csv("Cities/Sao Paulo/Basico_SP.csv",sep=";") %>%
+  rename("population" = V002,"income" = V009,"CD_GEOCODI"="Cod_setor") %>%
+  mutate(CD_GEOCODI = as.character(CD_GEOCODI))
+socio <- st_read("Cities/Sao Paulo/sp_ct_hex.shp")  %>%
+  mutate(CD_GEOCODI = as.character(CD_GEOCODI)) %>%
+  select(CD_GEOCODI,GEO_ID) %>%
+  mutate(area_polygon = as.numeric(st_area(.))) %>%
+  st_drop_geometry() %>%
+  select(CD_GEOCODI,GEO_ID,area_polygon) %>%
+  group_by(CD_GEOCODI) %>%
+  mutate(area_ct = sum(area_polygon,na.rm = T)) %>%
+  ungroup() %>%
+  left_join(socio,by="CD_GEOCODI") %>%
+  mutate(pop1 = population*area_polygon/area_ct) %>%
+  group_by(GEO_ID) %>%
+  summarize(pop = sum(pop1,na.rm = T),
+            income = sum(income*pop1,na.rm=T)/sum(pop1,na.rm=T)) %>%
+  ungroup() %>%
+  mutate(GEO_ID = as.character(GEO_ID)) %>%
+  mutate(income = income*(998/540))
+
+# Join travel time matrix with jobs database by destination
+hex <- read.csv("Cities/Sao Paulo/otp_output.csv") %>%
+  mutate(GEO_ID_i = as.character(fromPlace), GEO_ID_j = as.character(toPlace)) %>%
+  inner_join(st_read("Cities/Sao Paulo/sp_hex1000_data_MR.shp") %>%
+  filter(CD_GEOCODM == "3550308") %>%
+              st_drop_geometry() %>%
+              mutate(GEO_ID_i = GEO_ID) %>%
+               mutate(GEO_ID_i = as.character(GEO_ID_i)) %>%
+              select(GEO_ID_i), by="GEO_ID_i") %>%
+  inner_join(jobs %>%
+              mutate(GEO_ID_j = GEO_ID) %>%
+              select(GEO_ID_j,jobs), by="GEO_ID_j") %>%
+  inner_join(socio %>%
+              mutate(GEO_ID_i = GEO_ID) %>%
+              select(GEO_ID_i,pop,income), by="GEO_ID_i")  %>%
+  mutate(time = time/60,income=income/30) %>%
+  mutate(cost = 200*fare/income) %>%
+  filter(!is.na(cost))
+
+#n_jobs <- hex %>% group_by(GEO_ID_j) %>% summarise(jobs = mean(jobs, na.rm = T)) %>% ungroup()
+#n_jobs <- sum(n_jobs$jobs,na.rm=T)
+
+# Step 1 - destinations
+hex_dest <- hex %>%
+  filter(jobs >= 1) %>%
+  mutate(time30 = ifelse(time <= 30,pop,0),
+         time45 = ifelse(time <= 45,pop,0),
+         time60 = ifelse(time <= 60,pop,0),
+         time90 = ifelse(time <= 90,pop,0),
+         time120 = ifelse(time <= 120,pop,0),
+         board0 = ifelse(transfers <= 0,pop,0),
+         board1 = ifelse(transfers <= 1,pop,0),
+         board2 = ifelse(transfers <= 2,pop,0),
+         board3 = ifelse(transfers <= 3,pop,0),
+         board4 = ifelse(transfers <= 4,pop,0),
+         cost10 = ifelse(cost <= 10,pop,0),
+         cost20 = ifelse(cost <= 20,pop,0),
+         cost30 = ifelse(cost <= 30,pop,0),
+         cost40 = ifelse(cost <= 40,pop,0),
+         cost5 = ifelse(cost <= 5,pop,0)) %>%
+  group_by(GEO_ID_j) %>%
+  summarise(jobs = median(jobs,na.rm=T),
+            time30 = sum(time30,na.rm=T),
+            time45 = sum(time45,na.rm = T),
+            time60 = sum(time60,na.rm=T),
+            time90 = sum(time90,na.rm=T),
+            time120 = sum(time120,na.rm=T),
+            board0 = sum(board0,na.rm=T),
+            board1 = sum(board1,na.rm = T),
+            board2 = sum(board2,na.rm=T),
+            board3 = sum(board3,na.rm=T),
+            board4 = sum(board4,na.rm=T),
+            cost10 = sum(cost10,na.rm=T),
+            cost20 = sum(cost20,na.rm = T),
+            cost30 = sum(cost30,na.rm=T),
+            cost40 = sum(cost40,na.rm=T),
+            cost5 = sum(cost5,na.rm=T),) %>%
+  mutate_at(c("time30","time45","time60","time90","time120","board0","board1","board2","board3","board4","cost10","cost20","cost30","cost40","cost5"),~(p = jobs/(.)))
+
+# Step 2 - origins
+hex_orig <- hex %>% select(-jobs) %>%
+  filter(pop >= 1) %>%
+  left_join(hex_dest,by="GEO_ID_j") %>%
+  mutate(time30 = ifelse(time <= 30,time30,0),
+         time45 = ifelse(time <= 45,time45,0),
+         time60 = ifelse(time <= 60,time60,0),
+         time90 = ifelse(time <= 90,time90,0),
+         time120 = ifelse(time <= 120,time120,0),
+         board0 = ifelse(transfers <= 0,board0,0),
+         board1 = ifelse(transfers <= 1,board1,0),
+         board2 = ifelse(transfers <= 2,board2,0),
+         board3 = ifelse(transfers <= 3,board3,0),
+         board4 = ifelse(transfers <= 4,board4,0),
+         cost10 = ifelse(cost <= 10,cost10,0),
+         cost20 = ifelse(cost <= 20,cost20,0),
+         cost30 = ifelse(cost <= 30,cost30,0),
+         cost40 = ifelse(cost <= 40,cost40,0),
+         cost5 = ifelse(cost <= 5,cost5,0)) %>%
+  group_by(GEO_ID_i) %>%
+  summarise_at(c("time30","time45","time60","time90","time120","board0","board1","board2","board3","board4","cost10","cost20","cost30","cost40","cost5"),~sum(.,na.rm = T))
+
+# Join with socioeconomic data
+access_shp <- st_read("Cities/Sao Paulo/sp_hex1000_data_MR.shp") %>%
+  select(-pop,-jobs,-income) %>%
+  mutate(GEO_ID_i=GEO_ID) %>%
+  inner_join(hex_orig, by = "GEO_ID_i") %>%
+  inner_join(jobs,by=c("GEO_ID_i"="GEO_ID")) %>%
+  inner_join(socio,by=c("GEO_ID_i"="GEO_ID")) %>%
+  select(-GEO_ID_i) %>%
+  filter(CD_GEOCODM == "3550308")
+
+st_write(access_shp,"Cities/Sao Paulo/sp_access_2step.shp", delete_layer = TRUE)
+
+```
+
+```{r sp_sim_2step}
+
+hx <- st_read("Cities/Sao Paulo/sp_hex1000_data_MR.shp") %>%
+  filter(pop >= 0) %>%
+  mutate(GEO_ID = as.character(GEO_ID)) %>%
+  filter(CD_GEOCODM == "3550308")
+
+# Jobs
+jobs <- read.dbf("Cities/Sao Paulo/Banco de Dados/OD_2017.dbf") %>% 
+  filter(MUNI_DOM == 36) %>%
+  filter(F_PESS == 1) %>%
+  filter(TRAB1_RE == 2) %>%
+  select(FE_PESS,CO_TR1_X,CO_TR1_Y) %>%
+  rename("X" = CO_TR1_X, "Y" = CO_TR1_Y) %>%
+  rbind(read.dbf("Cities/Sao Paulo/Banco de Dados/OD_2017.dbf") %>% 
+          filter(F_PESS == 1) %>%
+          filter(MUNI_DOM == 36) %>%
+          filter(TRAB2_RE == 2) %>%
+          select(FE_PESS,CO_TR2_X,CO_TR2_Y) %>%
+          rename("X" = CO_TR2_X, "Y" = CO_TR2_Y)) %>%
+  na.omit() %>%
+  st_as_sf(coords=c("X","Y"),remove=F,crs=22523) %>%
+  st_transform(4326) %>%
+  st_join(hx,join=st_within) %>%
+  st_drop_geometry() %>%
+  group_by(GEO_ID) %>%
+  summarise(jobs = sum(FE_PESS,na.rm=T))
+
+# Income
+socio <- read.csv("Cities/Sao Paulo/Basico_SP.csv",sep=";") %>%
+  rename("population" = V002,"income" = V009,"CD_GEOCODI"="Cod_setor") %>%
+  mutate(CD_GEOCODI = as.character(CD_GEOCODI))
+socio <- st_read("Cities/Sao Paulo/sp_ct_hex.shp")  %>%
+  mutate(CD_GEOCODI = as.character(CD_GEOCODI)) %>%
+  select(CD_GEOCODI,GEO_ID) %>%
+  mutate(area_polygon = as.numeric(st_area(.))) %>%
+  st_drop_geometry() %>%
+  select(CD_GEOCODI,GEO_ID,area_polygon) %>%
+  group_by(CD_GEOCODI) %>%
+  mutate(area_ct = sum(area_polygon,na.rm = T)) %>%
+  ungroup() %>%
+  left_join(socio,by="CD_GEOCODI") %>%
+  mutate(pop1 = population*area_polygon/area_ct) %>%
+  group_by(GEO_ID) %>%
+  summarize(pop = sum(pop1,na.rm = T),
+            income = sum(income*pop1,na.rm=T)/sum(pop1,na.rm=T)) %>%
+  ungroup() %>%
+  mutate(GEO_ID = as.character(GEO_ID)) %>%
+  mutate(income = income*(998/540))
+
+# Join travel time matrix with jobs database by destination
+hex <- read.csv("Cities/Sao Paulo/otp_output.csv") %>%
+  left_join(read.csv("Cities/Sao Paulo/otp_output_bus.csv") %>%
+              rename("time_bus" = time,
+                     "transfers_bus" = transfers,
+                     "fare_bus" = fare),by=c("fromPlace","toPlace")) %>%
+  left_join(read.csv("Cities/Sao Paulo/otp_output_rail.csv") %>%
+              rename("time_rail" = time,
+                     "transfers_rail" = transfers,
+                     "fare_rail" = fare),by=c("fromPlace","toPlace")) %>%
+  mutate(GEO_ID_i = as.character(fromPlace), GEO_ID_j = as.character(toPlace)) %>%
+  inner_join(st_read("Cities/Sao Paulo/sp_hex1000_data_MR.shp")  %>%
+  filter(CD_GEOCODM == "3550308") %>%
+              st_drop_geometry() %>%
+              mutate(GEO_ID_i = GEO_ID) %>%
+              select(GEO_ID_i), by="GEO_ID_i") %>%
+  inner_join(jobs %>%
+              mutate(GEO_ID_j = GEO_ID) %>%
+              select(GEO_ID_j,jobs), by="GEO_ID_j") %>%
+  inner_join(socio %>%
+              mutate(GEO_ID_i = GEO_ID) %>%
+              select(GEO_ID_i,pop,income), by="GEO_ID_i")  %>%
+  mutate(time = time/60,
+         time_bus = time_bus/60,
+         time_rail=time_rail/60,
+         income=income/30) %>%
+  mutate(cost = 200*fare/income,
+         cost_bus = 200*fare_bus/income,
+         cost_rail = 200*fare_rail/income) %>%
+  filter(!is.na(cost)) %>%
+  mutate(time_min = ifelse(time_bus <= time_rail,time_bus,time_rail),
+         cost_min = ifelse(time_bus <= time_rail,cost_bus,cost_rail),
+         transfers_min = ifelse(time_bus <= time_rail,transfers_bus,transfers_rail))
+
+#n_jobs <- hex %>% group_by(GEO_ID_j) %>% summarise(jobs = mean(jobs, na.rm = T)) %>% ungroup()
+#n_jobs <- sum(n_jobs$jobs,na.rm=T)
+
+# Step 1 - destinations
+hex_dest <- hex %>%
+  filter(jobs >= 1) %>%
+  mutate(time30_10 = ifelse((time <= 30 & cost <= 10 & transfers <= 2) |
+                              (time_min <= 30 & cost_min <= 10 & transfers_min <= 2),pop,0),
+         time45_10 = ifelse((time <= 45 & cost <= 10 & transfers <= 2) |
+                              (time_min <= 45 & cost_min <= 10 & transfers_min <= 2),pop,0),
+         time60_10 = ifelse((time <= 60 & cost <= 10 & transfers <= 2) |
+                              (time_min <= 60 & cost_min <= 10 & transfers_min <= 2),pop,0),
+         time90_10 = ifelse((time <= 90 & cost <= 10 & transfers <= 2) |
+                              (time_min <= 90 & cost_min <= 10 & transfers_min <= 2),pop,0),
+         time120_10 = ifelse((time <= 120 & cost <= 10 & transfers <= 2) |
+                               (time_min <= 120 & cost_min <= 10 & transfers_min <= 2),pop,0),
+         time30_20 = ifelse((time <= 30 & cost <= 20 & transfers <= 2) |
+                              (time_min <= 30 & cost_min <= 20 & transfers_min <= 2),pop,0),
+         time45_20 = ifelse((time <= 45 & cost <= 20 & transfers <= 2) |
+                              (time_min <= 45 & cost_min <= 20 & transfers_min <= 2),pop,0),
+         time60_20 = ifelse((time <= 60 & cost <= 20 & transfers <= 2) |
+                              (time_min <= 60 & cost_min <= 20 & transfers_min <= 2),pop,0),
+         time90_20 = ifelse((time <= 90 & cost <= 20 & transfers <= 2) |
+                              (time_min <= 90 & cost_min <= 20 & transfers_min <= 2),pop,0),
+         time120_20 = ifelse((time <= 120 & cost <= 20 & transfers <= 2) |
+                               (time_min <= 120 & cost_min <= 20 & transfers_min <= 2),pop,0),
+         time30_30 = ifelse((time <= 30 & cost <= 30 & transfers <= 2) |
+                              (time_min <= 30 & cost_min <= 30 & transfers_min <= 2),pop,0),
+         time45_30 = ifelse((time <= 45 & cost <= 30 & transfers <= 2) |
+                              (time_min <= 45 & cost_min <= 30 & transfers_min <= 2),pop,0),
+         time60_30 = ifelse((time <= 60 & cost <= 30 & transfers <= 2) |
+                              (time_min <= 60 & cost_min <= 30 & transfers_min <= 2),pop,0),
+         time90_30 = ifelse((time <= 90 & cost <= 30 & transfers <= 2) |
+                              (time_min <= 90 & cost_min <= 30 & transfers_min <= 2),pop,0),
+         time120_30 = ifelse((time <= 120 & cost <= 30 & transfers <= 2) |
+                               (time_min <= 120 & cost_min <= 30 & transfers_min <= 2),pop,0)) %>%
+  group_by(GEO_ID_j) %>%
+  summarise(jobs = median(jobs,na.rm=T),
+            time30_10 = sum(time30_10,na.rm=T),
+            time45_10 = sum(time45_10,na.rm = T),
+            time60_10 = sum(time60_10,na.rm=T),
+            time90_10 = sum(time90_10,na.rm=T),
+            time120_10 = sum(time120_10,na.rm=T),
+            time30_20 = sum(time30_20,na.rm=T),
+            time45_20 = sum(time45_20,na.rm = T),
+            time60_20 = sum(time60_20,na.rm=T),
+            time90_20 = sum(time90_20,na.rm=T),
+            time120_20 = sum(time120_20,na.rm=T),
+            time30_30 = sum(time30_30,na.rm=T),
+            time45_30 = sum(time45_30,na.rm = T),
+            time60_30 = sum(time60_30,na.rm=T),
+            time90_30 = sum(time90_30,na.rm=T),
+            time120_30 = sum(time120_30,na.rm=T)) %>%
+  mutate_at(c("time30_10","time45_10","time60_10","time90_10","time120_10","time30_20","time45_20","time60_20","time90_20","time120_20","time30_30","time45_30","time60_30","time90_30","time120_30"),~(p = jobs/(.)))
+
+# Step 2 - origins
+hex_orig <- hex %>% select(-jobs) %>%
+  filter(pop >= 1) %>%
+  left_join(hex_dest,by="GEO_ID_j") %>%
+  mutate(time30_10 = ifelse((time <= 30 & cost <= 10 & transfers <= 2) |
+                              (time_min <= 30 & cost_min <= 10 & transfers_min <= 2),time30_10,0),
+         time45_10 = ifelse((time <= 45 & cost <= 10 & transfers <= 2) |
+                              (time_min <= 45 & cost_min <= 10 & transfers_min <= 2),time45_10,0),
+         time60_10 = ifelse((time <= 60 & cost <= 10 & transfers <= 2) |
+                              (time_min <= 60 & cost_min <= 10 & transfers_min <= 2),time60_10,0),
+         time90_10 = ifelse((time <= 90 & cost <= 10 & transfers <= 2) |
+                               (time_min <= 90 & cost_min <= 10 & transfers_min <= 2),time90_10,0),
+         time120_10 = ifelse((time <= 120 & cost <= 10 & transfers <= 2) |
+                               (time_min <= 120 & cost_min <= 10 & transfers_min <= 2),time120_10,0),
+         time30_20 = ifelse((time <= 30 & cost <= 20 & transfers <= 2) |
+                              (time_min <= 30 & cost_min <= 20 & transfers_min <= 2),time30_20,0),
+         time45_20 = ifelse((time <= 45 & cost <= 20 & transfers <= 2) |
+                              (time_min <= 45 & cost_min <= 20 & transfers_min <= 2),time45_20,0),
+         time60_20 = ifelse((time <= 60 & cost <= 20 & transfers <= 2) |
+                              (time_min <= 60 & cost_min <= 20 & transfers_min <= 2),time60_20,0),
+         time90_20 = ifelse((time <= 90 & cost <= 20 & transfers <= 2) |
+                               (time_min <= 90 & cost_min <= 20 & transfers_min <= 2),time90_20,0),
+         time120_20 = ifelse((time <= 120 & cost <= 20 & transfers <= 2) |
+                               (time_min <= 120 & cost_min <= 20 & transfers_min <= 2),time120_20,0),
+         time30_30 = ifelse((time <= 30 & cost <= 30 & transfers <= 2) |
+                              (time_min <= 30 & cost_min <= 30 & transfers_min <= 2),time30_30,0),
+         time45_30 = ifelse((time <= 45 & cost <= 30 & transfers <= 2) |
+                              (time_min <= 45 & cost_min <= 30 & transfers_min <= 2),time45_30,0),
+         time60_30 = ifelse((time <= 60 & cost <= 30 & transfers <= 2) |
+                              (time_min <= 60 & cost_min <= 30 & transfers_min <= 2),time60_30,0),
+         time90_30 = ifelse((time <= 90 & cost <= 30 & transfers <= 2) |
+                               (time_min <= 90 & cost_min <= 30 & transfers_min <= 2),time90_30,0),
+         time120_30 = ifelse((time <= 120 & cost <= 30 & transfers <= 2) |
+                               (time_min <= 120 & cost_min <= 30 & transfers_min <= 2),time120_30,0)) %>%
+  group_by(GEO_ID_i) %>%
+  summarise_at(c("time30_10","time45_10","time60_10","time90_10","time120_10","time30_20","time45_20","time60_20","time90_20","time120_20","time30_30","time45_30","time60_30","time90_30","time120_30"),~sum(.,na.rm = T))
+
+# Join with socioeconomic data
+access_shp <- st_read("Cities/Sao Paulo/sp_hex1000_data_MR.shp") %>%
+  select(-pop,-income,-jobs) %>%
+  mutate(GEO_ID_i=GEO_ID) %>%
+  inner_join(hex_orig, by = "GEO_ID_i") %>%
+  inner_join(jobs,by=c("GEO_ID_i"="GEO_ID")) %>%
+  inner_join(socio,by=c("GEO_ID_i"="GEO_ID")) %>%
+  select(-GEO_ID_i) %>%
+  filter(CD_GEOCODM == "3550308")
+
+st_write(access_shp,"Cities/Sao Paulo/sp_access_sim_2step.shp", delete_layer = TRUE)
+```
+
+```{r nyc_access_2step}
+
+hx <- st_read("Cities/NYC/nyc_hex1000_MR.shp") %>%
+  mutate(GEO_ID = as.character(GEO_ID))
+
+# Jobs
+jobs <- read_delim("Cities/NYC/ltrips_short_exp123_wkdy_final_noXYcoord.txt",delim=",") %>% 
+  filter(D_PURP %in% c("12","13")) %>%
+  group_by(D_TRACT) %>%
+  summarise(jobs = sum(EXP1_FINAL_WKD,na.rm=T)) %>%
+  mutate(D_TRACT = as.character(D_TRACT))
+jobs <- st_read("Cities/NYC/nyc_ct_hex.shp") %>%
+  mutate(area_polygon = as.numeric(st_area(.))) %>%
+  st_drop_geometry() %>%
+  mutate(ct2010 = paste0(STATE,COUNTY,ct2010)) %>%
+  group_by(ct2010) %>%
+  mutate(area_ct  = sum(area_polygon,na.rm = T)) %>%
+  ungroup() %>%
+  left_join(jobs,by=c("ct2010"="D_TRACT")) %>%
+  mutate(jobs = jobs*area_polygon/area_ct) %>%
+  group_by(GEO_ID) %>%
+  summarise(jobs = sum(jobs,na.rm = T)) %>%
+  mutate(GEO_ID = as.character(GEO_ID)) 
+
+# Income
+socio <- st_read("Cities/NYC/nyc_censustracts.shp") %>% st_drop_geometry() %>%
+  mutate(ct2010 = paste0(STATE,COUNTY,ct2010)) %>%
+  select(ct2010) %>%
+  left_join(read_csv("Cities/NYC/income2018mod.csv",na = "N") %>%
+  mutate(ct2010 = substr(ct,10,30)),by="ct2010") %>%
+  select(-ct) %>%
+  mutate_all(as.numeric) %>%
+  mutate(ct2010 = as.character(ct2010))
+socio <- st_read("Cities/NYC/nyc_ct_hex.shp") %>%
+  mutate(area_polygon = as.numeric(st_area(.))) %>%
+  st_drop_geometry() %>%
+  mutate(ct2010 = paste0(STATE,COUNTY,ct2010)) %>%
+  group_by(ct2010) %>%
+  mutate(area_ct  = sum(area_polygon,na.rm = T)) %>%
+  ungroup() %>%
+  left_join(socio,by="ct2010") %>%
+  mutate(pop1 = num_hh*area_polygon/area_ct) %>%
+  group_by(GEO_ID) %>%
+  summarize(pop = sum(pop1,na.rm = T),
+            income = sum(pc_inc*pop1,na.rm=T)/sum(pop1,na.rm=T)) %>%
+  ungroup() %>%
+  mutate(GEO_ID = as.character(GEO_ID)) %>%
+  mutate(income = income*(8.50/7.35))
+
+
+# Join travel time matrix with jobs database by destination
+hex <- read.csv("Cities/NYC/nyc_otp_output.csv") %>%
+  mutate(GEO_ID_i = as.character(fromPlace), GEO_ID_j = as.character(toPlace)) %>%
+  inner_join(st_read("Cities/NYC/nyc_hex1000_MR.shp") %>%
+              st_drop_geometry() %>%
+              mutate(GEO_ID_i = GEO_ID) %>%
+               mutate(GEO_ID_i = as.character(GEO_ID_i)) %>%
+              select(GEO_ID_i), by="GEO_ID_i") %>%
+  inner_join(jobs %>%
+              mutate(GEO_ID_j = GEO_ID) %>%
+              select(GEO_ID_j,jobs), by="GEO_ID_j") %>%
+  inner_join(socio %>%
+              mutate(GEO_ID_i = GEO_ID) %>%
+              select(GEO_ID_i,pop,income), by="GEO_ID_i") %>%
+  mutate(time = time/60,income=income/365) %>%
+  mutate(cost = 200*fare/income) %>%
+  filter(!is.na(cost))
+
+
+#n_jobs <- hex %>% group_by(GEO_ID_j) %>% summarise(jobs = mean(jobs, na.rm = T)) %>% ungroup()
+#n_jobs <- sum(n_jobs$jobs,na.rm=T)
+
+# Step 1 - destinations
+hex_dest <- hex %>%
+  filter(jobs >= 1) %>%
+  mutate(time30 = ifelse(time <= 30,pop,0),
+         time45 = ifelse(time <= 45,pop,0),
+         time60 = ifelse(time <= 60,pop,0),
+         time90 = ifelse(time <= 90,pop,0),
+         time120 = ifelse(time <= 120,pop,0),
+         board0 = ifelse(transfers <= 0,pop,0),
+         board1 = ifelse(transfers <= 1,pop,0),
+         board2 = ifelse(transfers <= 2,pop,0),
+         board3 = ifelse(transfers <= 3,pop,0),
+         board4 = ifelse(transfers <= 4,pop,0),
+         cost10 = ifelse(cost <= 10,pop,0),
+         cost20 = ifelse(cost <= 20,pop,0),
+         cost30 = ifelse(cost <= 30,pop,0),
+         cost40 = ifelse(cost <= 40,pop,0),
+         cost5 = ifelse(cost <= 5,pop,0)) %>%
+  group_by(GEO_ID_j) %>%
+  summarise(jobs = median(jobs,na.rm=T),
+            time30 = sum(time30,na.rm=T),
+            time45 = sum(time45,na.rm = T),
+            time60 = sum(time60,na.rm=T),
+            time90 = sum(time90,na.rm=T),
+            time120 = sum(time120,na.rm=T),
+            board0 = sum(board0,na.rm=T),
+            board1 = sum(board1,na.rm = T),
+            board2 = sum(board2,na.rm=T),
+            board3 = sum(board3,na.rm=T),
+            board4 = sum(board4,na.rm=T),
+            cost10 = sum(cost10,na.rm=T),
+            cost20 = sum(cost20,na.rm = T),
+            cost30 = sum(cost30,na.rm=T),
+            cost40 = sum(cost40,na.rm=T),
+            cost5 = sum(cost5,na.rm=T),) %>%
+  mutate_at(c("time30","time45","time60","time90","time120","board0","board1","board2","board3","board4","cost10","cost20","cost30","cost40","cost5"),~(p = jobs/(.)))
+
+# Step 2 - origins
+hex_orig <- hex %>% select(-jobs) %>%
+  filter(pop >= 1) %>%
+  left_join(hex_dest,by="GEO_ID_j") %>%
+  mutate(time30 = ifelse(time <= 30,time30,0),
+         time45 = ifelse(time <= 45,time45,0),
+         time60 = ifelse(time <= 60,time60,0),
+         time90 = ifelse(time <= 90,time90,0),
+         time120 = ifelse(time <= 120,time120,0),
+         board0 = ifelse(transfers <= 0,board0,0),
+         board1 = ifelse(transfers <= 1,board1,0),
+         board2 = ifelse(transfers <= 2,board2,0),
+         board3 = ifelse(transfers <= 3,board3,0),
+         board4 = ifelse(transfers <= 4,board4,0),
+         cost10 = ifelse(cost <= 10,cost10,0),
+         cost20 = ifelse(cost <= 20,cost20,0),
+         cost30 = ifelse(cost <= 30,cost30,0),
+         cost40 = ifelse(cost <= 40,cost40,0),
+         cost5 = ifelse(cost <= 5,cost5,0)) %>%
+  group_by(GEO_ID_i) %>%
+  summarise_at(c("time30","time45","time60","time90","time120","board0","board1","board2","board3","board4","cost10","cost20","cost30","cost40","cost5"),~sum(.,na.rm = T))
+
+# Join with socioeconomic data
+access_shp <- st_read("Cities/NYC/nyc_hex1000_MR.shp") %>%
+  mutate(GEO_ID = as.character(GEO_ID)) %>%
+  mutate(GEO_ID_i=GEO_ID) %>%
+  inner_join(hex_orig, by = "GEO_ID_i") %>%
+  inner_join(jobs,by=c("GEO_ID_i"="GEO_ID")) %>%
+  inner_join(socio,by=c("GEO_ID_i"="GEO_ID")) %>%
+  select(-GEO_ID_i)
+
+st_write(access_shp,"Cities/NYC/nyc_access_2step.shp", delete_layer = TRUE)
+
+```
+
+```{r nyc_sim_2step}
+
+hx <- st_read("Cities/NYC/nyc_hex1000_MR.shp") %>%
+  mutate(GEO_ID = as.character(GEO_ID))
+
+jobs <- read_delim("Cities/NYC/ltrips_short_exp123_wkdy_final_noXYcoord.txt",delim=",") %>% 
+  filter(D_PURP %in% c("12","13")) %>%
+  group_by(D_TRACT) %>%
+  summarise(jobs = sum(EXP1_FINAL_WKD,na.rm=T)) %>%
+  mutate(D_TRACT = as.character(D_TRACT))
+jobs <- st_read("Cities/NYC/nyc_ct_hex.shp") %>%
+  mutate(area_polygon = as.numeric(st_area(.))) %>%
+  st_drop_geometry() %>%
+  mutate(ct2010 = paste0(STATE,COUNTY,ct2010)) %>%
+  group_by(ct2010) %>%
+  mutate(area_ct  = sum(area_polygon,na.rm = T)) %>%
+  ungroup() %>%
+  left_join(jobs,by=c("ct2010"="D_TRACT")) %>%
+  mutate(jobs = jobs*area_polygon/area_ct) %>%
+  group_by(GEO_ID) %>%
+  summarise(jobs = sum(jobs,na.rm = T)) %>%
+  mutate(GEO_ID = as.character(GEO_ID)) 
+
+# Income
+socio <- st_read("Cities/NYC/nyc_censustracts.shp") %>% st_drop_geometry() %>%
+  mutate(ct2010 = paste0(STATE,COUNTY,ct2010)) %>%
+  select(ct2010) %>%
+  left_join(read_csv("Cities/NYC/income2018mod.csv",na = "N") %>%
+  mutate(ct2010 = substr(ct,10,30)),by="ct2010") %>%
+  select(-ct) %>%
+  mutate_all(as.numeric) %>%
+  mutate(ct2010 = as.character(ct2010))
+socio <- st_read("Cities/NYC/nyc_ct_hex.shp") %>%
+  mutate(area_polygon = as.numeric(st_area(.))) %>%
+  st_drop_geometry() %>%
+  mutate(ct2010 = paste0(STATE,COUNTY,ct2010)) %>%
+  group_by(ct2010) %>%
+  mutate(area_ct  = sum(area_polygon,na.rm = T)) %>%
+  ungroup() %>%
+  left_join(socio,by="ct2010") %>%
+  mutate(pop1 = num_hh*area_polygon/area_ct) %>%
+  group_by(GEO_ID) %>%
+  summarize(pop = sum(pop1,na.rm = T),
+            income = sum(pc_inc*pop1,na.rm=T)/sum(pop1,na.rm=T)) %>%
+  ungroup() %>%
+  mutate(GEO_ID = as.character(GEO_ID)) %>%
+  mutate(income = income*(8.50/7.35))
+
+# Join travel time matrix with jobs database by destination
+hex <- read.csv("Cities/NYC/nyc_otp_output.csv") %>%
+  mutate(GEO_ID_i = as.character(fromPlace), GEO_ID_j = as.character(toPlace)) %>%
+  inner_join(st_read("Cities/NYC/nyc_hex1000_MR.shp")%>%
+              st_drop_geometry() %>%
+              mutate(GEO_ID_i = GEO_ID) %>%
+               mutate(GEO_ID_i = as.character(GEO_ID_i)) %>%
+              select(GEO_ID_i), by="GEO_ID_i") %>%
+  inner_join(jobs %>%
+              mutate(GEO_ID_j = GEO_ID) %>%
+              select(GEO_ID_j,jobs), by="GEO_ID_j") %>%
+  inner_join(socio %>%
+              mutate(GEO_ID_i = GEO_ID) %>%
+              select(GEO_ID_i,pop,income), by="GEO_ID_i") %>%
+  mutate(time = time/60,income=income/365) %>%
+  mutate(cost = 200*fare/income) %>%
+  filter(!is.na(cost))
+
+#n_jobs <- hex %>% group_by(GEO_ID_j) %>% summarise(jobs = mean(jobs, na.rm = T)) %>% ungroup()
+#n_jobs <- sum(n_jobs$jobs,na.rm=T)
+
+# Step 1 - destinations
+hex_dest <- hex %>%
+  filter(jobs >= 1) %>%
+  mutate(time30_10 = ifelse(time <= 30 & cost <= 10 & transfers <= 2,pop,0),
+         time45_10 = ifelse(time <= 45 & cost <= 10 & transfers <= 2,pop,0),
+         time60_10 = ifelse(time <= 60 & cost <= 10 & transfers <= 2,pop,0),
+         time90_10 = ifelse(time <= 90 & cost <= 10 & transfers <= 2,pop,0),
+         time120_10 = ifelse(time <= 120 & cost <= 10 & transfers <= 2,pop,0),
+         time30_20 = ifelse(time <= 30 & cost <= 20 & transfers <= 2,pop,0),
+         time45_20 = ifelse(time <= 45 & cost <= 20 & transfers <= 2,pop,0),
+         time60_20 = ifelse(time <= 60 & cost <= 20 & transfers <= 2,pop,0),
+         time90_20 = ifelse(time <= 90 & cost <= 20 & transfers <= 2,pop,0),
+         time120_20 = ifelse(time <= 120 & cost <= 20 & transfers <= 2,pop,0),
+         time30_30 = ifelse(time <= 30 & cost <= 30 & transfers <= 2,pop,0),
+         time45_30 = ifelse(time <= 45 & cost <= 30 & transfers <= 2,pop,0),
+         time60_30 = ifelse(time <= 60 & cost <= 30 & transfers <= 2,pop,0),
+         time90_30 = ifelse(time <= 90 & cost <= 30 & transfers <= 2,pop,0),
+         time120_30 = ifelse(time <= 120 & cost <= 30 & transfers <= 2,pop,0)) %>%
+  group_by(GEO_ID_j) %>%
+  summarise(jobs = median(jobs,na.rm=T),
+            time30_10 = sum(time30_10,na.rm=T),
+            time45_10 = sum(time45_10,na.rm = T),
+            time60_10 = sum(time60_10,na.rm=T),
+            time90_10 = sum(time90_10,na.rm=T),
+            time120_10 = sum(time120_10,na.rm=T),
+            time30_20 = sum(time30_20,na.rm=T),
+            time45_20 = sum(time45_20,na.rm = T),
+            time60_20 = sum(time60_20,na.rm=T),
+            time90_20 = sum(time90_20,na.rm=T),
+            time120_20 = sum(time120_20,na.rm=T),
+            time30_30 = sum(time30_30,na.rm=T),
+            time45_30 = sum(time45_30,na.rm = T),
+            time60_30 = sum(time60_30,na.rm=T),
+            time90_30 = sum(time90_30,na.rm=T),
+            time120_30 = sum(time120_30,na.rm=T)) %>%
+  mutate_at(c("time30_10","time45_10","time60_10","time90_10","time120_10","time30_20","time45_20","time60_20","time90_20","time120_20","time30_30","time45_30","time60_30","time90_30","time120_30"),~(p = jobs/(.)))
+
+# Step 2 - origins
+hex_orig <- hex %>% select(-jobs) %>%
+  filter(pop >= 1) %>%
+  left_join(hex_dest,by="GEO_ID_j") %>%
+  mutate(time30_10 = ifelse(time <= 30 & cost <= 10 & transfers <= 2,time30_10,0),
+         time45_10 = ifelse(time <= 45 & cost <= 10 & transfers <= 2,time45_10,0),
+         time60_10 = ifelse(time <= 60 & cost <= 10 & transfers <= 2,time60_10,0),
+         time90_10 = ifelse(time <= 90 & cost <= 10 & transfers <= 2,time90_10,0),
+         time120_10 = ifelse(time <= 120 & cost <= 10 & transfers <= 2,time120_10,0),
+         time30_20 = ifelse(time <= 30 & cost <= 20 & transfers <= 2,time30_20,0),
+         time45_20 = ifelse(time <= 45 & cost <= 20 & transfers <= 2,time45_20,0),
+         time60_20 = ifelse(time <= 60 & cost <= 20 & transfers <= 2,time60_20,0),
+         time90_20 = ifelse(time <= 90 & cost <= 20 & transfers <= 2,time90_20,0),
+         time120_20 = ifelse(time <= 120 & cost <= 20 & transfers <= 2,time120_20,0),
+         time30_30 = ifelse(time <= 30 & cost <= 30 & transfers <= 2,time30_30,0),
+         time45_30 = ifelse(time <= 45 & cost <= 30 & transfers <= 2,time45_30,0),
+         time60_30 = ifelse(time <= 60 & cost <= 30 & transfers <= 2,time60_30,0),
+         time90_30 = ifelse(time <= 90 & cost <= 30 & transfers <= 2,time90_30,0),
+         time120_30 = ifelse(time <= 120 & cost <= 30 & transfers <= 2,time120_30,0)) %>%
+  group_by(GEO_ID_i) %>%
+  summarise_at(c("time30_10","time45_10","time60_10","time90_10","time120_10","time30_20","time45_20","time60_20","time90_20","time120_20","time30_30","time45_30","time60_30","time90_30","time120_30"),~sum(.,na.rm = T))
+
+# Join with socioeconomic data
+access_shp <- st_read("Cities/NYC/nyc_hex1000_MR.shp") %>%
+  mutate(GEO_ID = as.character(GEO_ID)) %>%
+  mutate(GEO_ID_i=GEO_ID) %>%
+  inner_join(hex_orig, by = "GEO_ID_i") %>%
+  inner_join(jobs,by=c("GEO_ID_i"="GEO_ID")) %>%
+  inner_join(socio,by=c("GEO_ID_i"="GEO_ID")) %>%
+  select(-GEO_ID_i)
+
+st_write(access_shp,"Cities/NYC/nyc_access_sim_2step.shp", delete_layer = TRUE)
+
+```
+
+```{r lon_access_2step, eval = F}
+
+hx <- st_read("Cities/London/lon_hex1000_MR.shp") %>%
+  mutate(GEO_ID = as.character(GEO_ID))
+
+# Jobs
+jobs <- read.csv("Cities/London/LD_Jobs_Tot.csv",sep=";") %>%
+  select(code,workplaceP)
+jobs <- st_read("Cities/London/lon_MSOA_hex.shp") %>%
+  mutate(area_polygon = as.numeric(st_area(.))) %>%
+  st_drop_geometry() %>%
+  mutate(code=CODE) %>%
+  select(code,GEO_ID,area_polygon) %>%
+  group_by(code) %>%
+  mutate(area_ct  = sum(area_polygon,na.rm = T)) %>%
+  ungroup() %>%
+  left_join(jobs,by="code") %>%
+  mutate(jobs = workplaceP*area_polygon/area_ct) %>%
+  group_by(GEO_ID) %>%
+  summarise(jobs = sum(jobs,na.rm = T)) %>%
+  mutate(GEO_ID = as.character(GEO_ID)) 
+
+
+# Income
+socio <- read.csv("Cities/London/modelled-household-income-estimates-lsoa.csv",sep=";") %>%
+  left_join(read.csv("Cities/London/Data_UNIT_URESPOP.csv",sep=";"),by=c("Code"="GEO_CODE")) %>%
+  mutate(income=(Mean.2012.13*Households)/Population.in.Households) %>%
+  select(Code,income,Population)
+socio <- st_read("Cities/London/lon_LSOA_hex.shp") %>%
+  select(LSOA11CD,GEO_ID) %>%
+  rename("Code" = LSOA11CD) %>%
+  mutate(area_polygon = as.numeric(st_area(.))) %>%
+  st_drop_geometry() %>%
+  select(Code,GEO_ID,area_polygon) %>%
+  group_by(Code) %>%
+  mutate(area_ct  = sum(area_polygon,na.rm = T)) %>%
+  ungroup() %>%
+  left_join(socio,by="Code") %>%
+  mutate(pop1 = Population*area_polygon/area_ct) %>%
+  group_by(GEO_ID) %>%
+  summarize(pop = sum(pop1,na.rm = T),
+            income = sum(income*pop1,na.rm=T)/sum(pop1,na.rm=T)) %>%
+  ungroup() %>%
+  mutate(GEO_ID = as.character(GEO_ID)) %>%
+  mutate(income = income*(8.21/6.08))
+
+
+# Join travel time matrix with jobs database by destination
+hex <- read.csv("Cities/London/lon_otp_output.csv") %>%
+  mutate(GEO_ID_i = as.character(fromPlace), GEO_ID_j = as.character(toPlace)) %>%
+  inner_join(st_read("Cities/London/lon_hex1000_MR.shp") %>%
+              st_drop_geometry() %>%
+              mutate(GEO_ID_i = GEO_ID) %>%
+               mutate(GEO_ID_i = as.character(GEO_ID_i)) %>%
+              select(GEO_ID_i), by="GEO_ID_i") %>%
+  inner_join(jobs %>%
+              mutate(GEO_ID_j = GEO_ID) %>%
+              select(GEO_ID_j,jobs), by="GEO_ID_j") %>%
+  inner_join(socio %>%
+              mutate(GEO_ID_i = GEO_ID) %>%
+              select(GEO_ID_i,pop,income), by="GEO_ID_i") %>%
+  mutate(time = time/60,income=income/365) %>%
+  mutate(cost = 200*fare/income) %>%
+  filter(!is.na(cost))
+
+#n_jobs <- hex %>% group_by(GEO_ID_j) %>% summarise(jobs = mean(jobs, na.rm = T)) %>% ungroup()
+#n_jobs <- sum(n_jobs$jobs,na.rm=T)
+
+# Step 1 - destinations
+hex_dest <- hex %>%
+  filter(jobs >= 1) %>%
+  mutate(time30 = ifelse(time <= 30,pop,0),
+         time45 = ifelse(time <= 45,pop,0),
+         time60 = ifelse(time <= 60,pop,0),
+         time90 = ifelse(time <= 90,pop,0),
+         time120 = ifelse(time <= 120,pop,0),
+         board0 = ifelse(transfers <= 0,pop,0),
+         board1 = ifelse(transfers <= 1,pop,0),
+         board2 = ifelse(transfers <= 2,pop,0),
+         board3 = ifelse(transfers <= 3,pop,0),
+         board4 = ifelse(transfers <= 4,pop,0),
+         cost10 = ifelse(cost <= 10,pop,0),
+         cost20 = ifelse(cost <= 20,pop,0),
+         cost30 = ifelse(cost <= 30,pop,0),
+         cost40 = ifelse(cost <= 40,pop,0),
+         cost5 = ifelse(cost <= 5,pop,0),
+         cost25 = ifelse(cost <= 2.5,pop,0)) %>%
+  group_by(GEO_ID_j) %>%
+  summarise(jobs = median(jobs,na.rm=T),
+            time30 = sum(time30,na.rm=T),
+            time45 = sum(time45,na.rm = T),
+            time60 = sum(time60,na.rm=T),
+            time90 = sum(time90,na.rm=T),
+            time120 = sum(time120,na.rm=T),
+            board0 = sum(board0,na.rm=T),
+            board1 = sum(board1,na.rm = T),
+            board2 = sum(board2,na.rm=T),
+            board3 = sum(board3,na.rm=T),
+            board4 = sum(board4,na.rm=T),
+            cost10 = sum(cost10,na.rm=T),
+            cost20 = sum(cost20,na.rm = T),
+            cost30 = sum(cost30,na.rm=T),
+            cost40 = sum(cost40,na.rm=T),
+            cost5 = sum(cost5,na.rm=T),
+            cost25 = sum(cost25,na.rm=T)) %>%
+  mutate_at(c("time30","time45","time60","time90","time120","board0","board1","board2","board3","board4","cost10","cost20","cost30","cost40","cost5","cost25"),~(p = jobs/(.)))
+
+# Step 2 - origins
+hex_orig <- hex %>% select(-jobs) %>%
+  filter(pop >= 1) %>%
+  left_join(hex_dest,by="GEO_ID_j") %>%
+  mutate(time30 = ifelse(time <= 30,time30,0),
+         time45 = ifelse(time <= 45,time45,0),
+         time60 = ifelse(time <= 60,time60,0),
+         time90 = ifelse(time <= 90,time90,0),
+         time120 = ifelse(time <= 120,time120,0),
+         board0 = ifelse(transfers <= 0,board0,0),
+         board1 = ifelse(transfers <= 1,board1,0),
+         board2 = ifelse(transfers <= 2,board2,0),
+         board3 = ifelse(transfers <= 3,board3,0),
+         board4 = ifelse(transfers <= 4,board4,0),
+         cost10 = ifelse(cost <= 10,cost10,0),
+         cost20 = ifelse(cost <= 20,cost20,0),
+         cost30 = ifelse(cost <= 30,cost30,0),
+         cost40 = ifelse(cost <= 40,cost40,0),
+         cost5 = ifelse(cost <= 5,cost5,0),
+         cost25 = ifelse(cost <= 2.5,cost5,0)) %>%
+  group_by(GEO_ID_i) %>%
+  summarise_at(c("time30","time45","time60","time90","time120","board0","board1","board2","board3","board4","cost10","cost20","cost30","cost40","cost5","cost25"),~sum(.,na.rm = T))
+
+# Join with socioeconomic data
+access_shp <- st_read("Cities/London/lon_hex1000_MR.shp") %>%
+  mutate(GEO_ID = as.character(GEO_ID)) %>%
+  mutate(GEO_ID_i=GEO_ID) %>%
+  inner_join(hex_orig, by = "GEO_ID_i") %>%
+  inner_join(jobs,by=c("GEO_ID_i"="GEO_ID")) %>%
+  inner_join(socio,by=c("GEO_ID_i"="GEO_ID")) %>%
+  select(-GEO_ID_i)
+
+st_write(access_shp,"Cities/London/lon_access_2step.shp", delete_layer = TRUE)
+
+```
+
+```{r lon_sim_2step, eval = F}
+
+hx <- st_read("Cities/London/lon_hex1000_MR.shp") %>%
+  mutate(GEO_ID = as.character(GEO_ID))
+
+# Jobs
+jobs <- read.csv("Cities/London/LD_Jobs_Tot.csv",sep=";") %>%
+  select(code,workplaceP)
+jobs <- st_read("Cities/London/lon_MSOA_hex.shp") %>%
+  mutate(area_polygon = as.numeric(st_area(.))) %>%
+  st_drop_geometry() %>%
+  mutate(code=CODE) %>%
+  select(code,GEO_ID,area_polygon) %>%
+  group_by(code) %>%
+  mutate(area_ct  = sum(area_polygon,na.rm = T)) %>%
+  ungroup() %>%
+  left_join(jobs,by="code") %>%
+  mutate(jobs = workplaceP*area_polygon/area_ct) %>%
+  group_by(GEO_ID) %>%
+  summarise(jobs = sum(jobs,na.rm = T)) %>%
+  mutate(GEO_ID = as.character(GEO_ID)) 
+
+
+# Income
+socio <- read.csv("Cities/London/modelled-household-income-estimates-lsoa.csv",sep=";") %>%
+  left_join(read.csv("Cities/London/Data_UNIT_URESPOP.csv",sep=";"),by=c("Code"="GEO_CODE")) %>%
+  mutate(income=(Mean.2012.13*Households)/Population.in.Households) %>%
+  select(Code,income,Population)
+socio <- st_read("Cities/London/lon_LSOA_hex.shp") %>%
+  select(LSOA11CD,GEO_ID) %>%
+  rename("Code" = LSOA11CD) %>%
+  mutate(area_polygon = as.numeric(st_area(.))) %>%
+  st_drop_geometry() %>%
+  select(Code,GEO_ID,area_polygon) %>%
+  group_by(Code) %>%
+  mutate(area_ct  = sum(area_polygon,na.rm = T)) %>%
+  ungroup() %>%
+  left_join(socio,by="Code") %>%
+  mutate(pop1 = Population*area_polygon/area_ct) %>%
+  group_by(GEO_ID) %>%
+  summarize(pop = sum(pop1,na.rm = T),
+            income = sum(income*pop1,na.rm=T)/sum(pop1,na.rm=T)) %>%
+  ungroup() %>%
+  mutate(GEO_ID = as.character(GEO_ID)) %>%
+  mutate(income = income*(8.21/6.08))
+
+# Join travel time matrix with jobs database by destination
+hex <- read.csv("Cities/London/lon_otp_output.csv") %>%
+  mutate(GEO_ID_i = as.character(fromPlace), GEO_ID_j = as.character(toPlace)) %>%
+  inner_join(st_read("Cities/London/lon_hex1000_MR.shp") %>%
+              st_drop_geometry() %>%
+              mutate(GEO_ID_i = GEO_ID) %>%
+               mutate(GEO_ID_i = as.character(GEO_ID_i)) %>%
+              select(GEO_ID_i), by="GEO_ID_i") %>%
+  inner_join(jobs %>%
+              mutate(GEO_ID_j = GEO_ID) %>%
+              select(GEO_ID_j,jobs), by="GEO_ID_j") %>%
+  inner_join(socio %>%
+              mutate(GEO_ID_i = GEO_ID) %>%
+              select(GEO_ID_i,pop,income), by="GEO_ID_i")%>%
+  mutate(time = time/60,income=income/365) %>%
+  mutate(cost = 200*fare/income) %>%
+  filter(!is.na(cost))
+
+#n_jobs <- hex %>% group_by(GEO_ID_j) %>% summarise(jobs = mean(jobs, na.rm = T)) %>% ungroup()
+#n_jobs <- sum(n_jobs$jobs,na.rm=T)
+
+# Step 1 - destinations
+hex_dest <- hex %>%
+  filter(jobs >= 1) %>%
+  mutate(time30_10 = ifelse(time <= 30 & cost <= 10 & transfers <= 2,pop,0),
+         time45_10 = ifelse(time <= 45 & cost <= 10 & transfers <= 2,pop,0),
+         time60_10 = ifelse(time <= 60 & cost <= 10 & transfers <= 2,pop,0),
+         time90_10 = ifelse(time <= 90 & cost <= 10 & transfers <= 2,pop,0),
+         time120_10 = ifelse(time <= 120 & cost <= 10 & transfers <= 2,pop,0),
+         time30_20 = ifelse(time <= 30 & cost <= 20 & transfers <= 2,pop,0),
+         time45_20 = ifelse(time <= 45 & cost <= 20 & transfers <= 2,pop,0),
+         time60_20 = ifelse(time <= 60 & cost <= 20 & transfers <= 2,pop,0),
+         time90_20 = ifelse(time <= 90 & cost <= 20 & transfers <= 2,pop,0),
+         time120_20 = ifelse(time <= 120 & cost <= 20 & transfers <= 2,pop,0),
+         time30_30 = ifelse(time <= 30 & cost <= 30 & transfers <= 2,pop,0),
+         time45_30 = ifelse(time <= 45 & cost <= 30 & transfers <= 2,pop,0),
+         time60_30 = ifelse(time <= 60 & cost <= 30 & transfers <= 2,pop,0),
+         time90_30 = ifelse(time <= 90 & cost <= 30 & transfers <= 2,pop,0),
+         time120_30 = ifelse(time <= 120 & cost <= 30 & transfers <= 2,pop,0)) %>%
+  group_by(GEO_ID_j) %>%
+  summarise(jobs = median(jobs,na.rm=T),
+            time30_10 = sum(time30_10,na.rm=T),
+            time45_10 = sum(time45_10,na.rm = T),
+            time60_10 = sum(time60_10,na.rm=T),
+            time90_10 = sum(time90_10,na.rm=T),
+            time120_10 = sum(time120_10,na.rm=T),
+            time30_20 = sum(time30_20,na.rm=T),
+            time45_20 = sum(time45_20,na.rm = T),
+            time60_20 = sum(time60_20,na.rm=T),
+            time90_20 = sum(time90_20,na.rm=T),
+            time120_20 = sum(time120_20,na.rm=T),
+            time30_30 = sum(time30_30,na.rm=T),
+            time45_30 = sum(time45_30,na.rm = T),
+            time60_30 = sum(time60_30,na.rm=T),
+            time90_30 = sum(time90_30,na.rm=T),
+            time120_30 = sum(time120_30,na.rm=T)) %>%
+  mutate_at(c("time30_10","time45_10","time60_10","time90_10","time120_10","time30_20","time45_20","time60_20","time90_20","time120_20","time30_30","time45_30","time60_30","time90_30","time120_30"),~(p = jobs/(.)))
+
+# Step 2 - origins
+hex_orig <- hex %>% select(-jobs) %>%
+  filter(pop >= 1) %>%
+  left_join(hex_dest,by="GEO_ID_j") %>%
+  mutate(time30_10 = ifelse(time <= 30 & cost <= 10 & transfers <= 2,time30_10,0),
+         time45_10 = ifelse(time <= 45 & cost <= 10 & transfers <= 2,time45_10,0),
+         time60_10 = ifelse(time <= 60 & cost <= 10 & transfers <= 2,time60_10,0),
+         time90_10 = ifelse(time <= 90 & cost <= 10 & transfers <= 2,time90_10,0),
+         time120_10 = ifelse(time <= 120 & cost <= 10 & transfers <= 2,time120_10,0),
+         time30_20 = ifelse(time <= 30 & cost <= 20 & transfers <= 2,time30_20,0),
+         time45_20 = ifelse(time <= 45 & cost <= 20 & transfers <= 2,time45_20,0),
+         time60_20 = ifelse(time <= 60 & cost <= 20 & transfers <= 2,time60_20,0),
+         time90_20 = ifelse(time <= 90 & cost <= 20 & transfers <= 2,time90_20,0),
+         time120_20 = ifelse(time <= 120 & cost <= 20 & transfers <= 2,time120_20,0),
+         time30_30 = ifelse(time <= 30 & cost <= 30 & transfers <= 2,time30_30,0),
+         time45_30 = ifelse(time <= 45 & cost <= 30 & transfers <= 2,time45_30,0),
+         time60_30 = ifelse(time <= 60 & cost <= 30 & transfers <= 2,time60_30,0),
+         time90_30 = ifelse(time <= 90 & cost <= 30 & transfers <= 2,time90_30,0),
+         time120_30 = ifelse(time <= 120 & cost <= 30 & transfers <= 2,time120_30,0)) %>%
+  group_by(GEO_ID_i) %>%
+  summarise_at(c("time30_10","time45_10","time60_10","time90_10","time120_10","time30_20","time45_20","time60_20","time90_20","time120_20","time30_30","time45_30","time60_30","time90_30","time120_30"),~sum(.,na.rm = T))
+
+# Join with socioeconomic data
+access_shp <- st_read("Cities/London/lon_hex1000_MR.shp") %>%
+  mutate(GEO_ID = as.character(GEO_ID)) %>%
+  mutate(GEO_ID_i=GEO_ID) %>%
+  inner_join(hex_orig, by = "GEO_ID_i") %>%
+  inner_join(jobs,by=c("GEO_ID_i"="GEO_ID")) %>%
+  inner_join(socio,by=c("GEO_ID_i"="GEO_ID")) %>%
+  select(-GEO_ID_i)
+
+st_write(access_shp,"Cities/London/lon_access_sim_2step.shp", delete_layer = TRUE)
+
+```
+
+```{r access_gini}
+
+access <- st_read("Cities/Sao Paulo/sp_access_2step.shp") %>%
+  st_drop_geometry()
+access_sim <- st_read("Cities/Sao Paulo/sp_access_sim_2step.shp") %>%
+  st_drop_geometry()
+
+# Gini
+gini_sp <- tibble(
+  dimension = c(rep("Time",5),rep("Cost",5),rep("Transfers",5),rep("Time10",5),rep("Time20",5),rep("Time30",5)),
+  metric = c(30,45,60,90,120,5,10,20,30,40,0,1,2,3,4,30,45,60,90,120,30,45,60,90,120,30,45,60,90,120),
+  gini = c(Gini(access$time30,access$pop,na.rm = T),
+           Gini(access$time45,access$pop,na.rm=T),
+           Gini(access$time60,access$pop,na.rm=T),
+           Gini(access$time90,access$pop,na.rm=T),
+           Gini(access$time120,access$pop,na.rm=T),
+           Gini(access$cost5,access$pop,na.rm = T),
+           Gini(access$cost10,access$pop,na.rm=T),
+           Gini(access$cost20,access$pop,na.rm=T),
+           Gini(access$cost30,access$pop,na.rm=T),
+           Gini(access$cost40,access$pop,na.rm=T),
+           Gini(access$board0,access$pop,na.rm = T),
+           Gini(access$board1,access$pop,na.rm=T),
+           Gini(access$board2,access$pop,na.rm=T),
+           Gini(access$board3,access$pop,na.rm=T),
+           Gini(access$board4,access$pop,na.rm=T),
+           Gini(access_sim$time30_10,access_sim$pop,na.rm = T),
+           Gini(access_sim$time45_10,access_sim$pop,na.rm=T),
+           Gini(access_sim$time60_10,access_sim$pop,na.rm=T),
+           Gini(access_sim$time90_10,access_sim$pop,na.rm=T),
+           Gini(access_sim$time120_10,access_sim$pop,na.rm=T),
+           Gini(access_sim$time30_20,access_sim$pop,na.rm = T),
+           Gini(access_sim$time45_20,access_sim$pop,na.rm=T),
+           Gini(access_sim$time60_20,access_sim$pop,na.rm=T),
+           Gini(access_sim$time90_20,access_sim$pop,na.rm=T),
+           Gini(access_sim$time120_20,access_sim$pop,na.rm=T),
+           Gini(access_sim$time30_30,access_sim$pop,na.rm = T),
+           Gini(access_sim$time45_30,access_sim$pop,na.rm=T),
+           Gini(access_sim$time60_30,access_sim$pop,na.rm=T),
+           Gini(access_sim$time90_30,access_sim$pop,na.rm=T),
+           Gini(access_sim$time120_30,access_sim$pop,na.rm=T)))
+
+
+access <- st_read("Cities/NYC/nyc_access_2step.shp") %>%
+  st_drop_geometry()
+access_sim <- st_read("Cities/NYC/nyc_access_sim_2step.shp") %>%
+  st_drop_geometry()
+
+# Gini
+gini_nyc <- tibble(
+  dimension = c(rep("Time",5),rep("Cost",5),rep("Transfers",5),rep("Time10",5),rep("Time20",5),rep("Time30",5)),
+  metric = c(30,45,60,90,120,5,10,20,30,40,0,1,2,3,4,30,45,60,90,120,30,45,60,90,120,30,45,60,90,120),
+  gini = c(Gini(access$time30,access$pop,na.rm = T),
+           Gini(access$time45,access$pop,na.rm=T),
+           Gini(access$time60,access$pop,na.rm=T),
+           Gini(access$time90,access$pop,na.rm=T),
+           Gini(access$time120,access$pop,na.rm=T),
+           Gini(access$cost5,access$pop,na.rm = T),
+           Gini(access$cost10,access$pop,na.rm=T),
+           Gini(access$cost20,access$pop,na.rm=T),
+           Gini(access$cost30,access$pop,na.rm=T),
+           Gini(access$cost40,access$pop,na.rm=T),
+           Gini(access$board0,access$pop,na.rm = T),
+           Gini(access$board1,access$pop,na.rm=T),
+           Gini(access$board2,access$pop,na.rm=T),
+           Gini(access$board3,access$pop,na.rm=T),
+           Gini(access$board4,access$pop,na.rm=T),
+           Gini(access_sim$time30_10,access_sim$pop,na.rm = T),
+           Gini(access_sim$time45_10,access_sim$pop,na.rm=T),
+           Gini(access_sim$time60_10,access_sim$pop,na.rm=T),
+           Gini(access_sim$time90_10,access_sim$pop,na.rm=T),
+           Gini(access_sim$time120_10,access_sim$pop,na.rm=T),
+           Gini(access_sim$time30_20,access_sim$pop,na.rm = T),
+           Gini(access_sim$time45_20,access_sim$pop,na.rm=T),
+           Gini(access_sim$time60_20,access_sim$pop,na.rm=T),
+           Gini(access_sim$time90_20,access_sim$pop,na.rm=T),
+           Gini(access_sim$time120_20,access_sim$pop,na.rm=T),
+           Gini(access_sim$time30_30,access_sim$pop,na.rm = T),
+           Gini(access_sim$time45_30,access_sim$pop,na.rm=T),
+           Gini(access_sim$time60_30,access_sim$pop,na.rm=T),
+           Gini(access_sim$time90_30,access_sim$pop,na.rm=T),
+           Gini(access_sim$time120_30,access_sim$pop,na.rm=T)))
+  
+access <- st_read("Cities/London/lon_access_2step.shp") %>%
+  st_drop_geometry()
+access_sim <- st_read("Cities/London/lon_access_sim_2step.shp") %>%
+  st_drop_geometry()
+
+# Gini
+gini_lon <- tibble(
+  dimension = c(rep("Time",5),rep("Cost",5),rep("Transfers",5),rep("Time10",5),rep("Time20",5),rep("Time30",5)),
+  metric = c(30,45,60,90,120,5,10,20,30,40,0,1,2,3,4,30,45,60,90,120,30,45,60,90,120,30,45,60,90,120),
+  gini = c(Gini(access$time30,access$pop,na.rm = T),
+           Gini(access$time45,access$pop,na.rm=T),
+           Gini(access$time60,access$pop,na.rm=T),
+           Gini(access$time90,access$pop,na.rm=T),
+           Gini(access$time120,access$pop,na.rm=T),
+           Gini(access$cost5,access$pop,na.rm = T),
+           Gini(access$cost10,access$pop,na.rm=T),
+           Gini(access$cost20,access$pop,na.rm=T),
+           Gini(access$cost30,access$pop,na.rm=T),
+           Gini(access$cost40,access$pop,na.rm=T),
+           Gini(access$board0,access$pop,na.rm = T),
+           Gini(access$board1,access$pop,na.rm=T),
+           Gini(access$board2,access$pop,na.rm=T),
+           Gini(access$board3,access$pop,na.rm=T),
+           Gini(access$board4,access$pop,na.rm=T),
+           Gini(access_sim$time30_10,access_sim$pop,na.rm = T),
+           Gini(access_sim$time45_10,access_sim$pop,na.rm=T),
+           Gini(access_sim$time60_10,access_sim$pop,na.rm=T),
+           Gini(access_sim$time90_10,access_sim$pop,na.rm=T),
+           Gini(access_sim$time120_10,access_sim$pop,na.rm=T),
+           Gini(access_sim$time30_20,access_sim$pop,na.rm = T),
+           Gini(access_sim$time45_20,access_sim$pop,na.rm=T),
+           Gini(access_sim$time60_20,access_sim$pop,na.rm=T),
+           Gini(access_sim$time90_20,access_sim$pop,na.rm=T),
+           Gini(access_sim$time120_20,access_sim$pop,na.rm=T),
+           Gini(access_sim$time30_30,access_sim$pop,na.rm = T),
+           Gini(access_sim$time45_30,access_sim$pop,na.rm=T),
+           Gini(access_sim$time60_30,access_sim$pop,na.rm=T),
+           Gini(access_sim$time90_30,access_sim$pop,na.rm=T),
+           Gini(access_sim$time120_30,access_sim$pop,na.rm=T)))
+
+gini <- gini_sp %>% mutate(City = "São Paulo") %>% rbind(gini_nyc %>% mutate(City = "New York City")) %>% rbind(gini_lon %>% mutate(City = "London")) %>%
+  mutate(dimension = factor(dimension,levels=c("Time","Cost","Transfers","Time10","Time20","Time30"))) %>% arrange(dimension) %>%
+mutate(City = factor(City,levels=c("São Paulo","New York City","London"))) %>%
+  mutate(metric=factor(as.character(metric),levels=c("0","1","2","3","4","5","10","20","30","40","45","60","90","120"))) %>%
+  filter(dimension %in% c("Time","Cost","Transfers","Time20"))
+
+gini %>%
+  ggplot(aes(x=metric,y=gini,color=City,group=City)) +
+  geom_point(alpha=0.8) +
+  geom_line(size=1,alpha=0.8) +
+  facet_wrap(~dimension,scales = "free") +
+  scale_color_viridis_d(option="A",begin=0.3,end=0.7) +
+  ylim(0,1) +
+  xlab("Threshold") +
+  ylab("Gini") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+  
+ggsave("Cities/sp_nyc_lon_gini_2step.jpeg",dpi=600,height = 5,width=7.5)
+
+```
+
+# Cumulative
+
+```{r sp_access_cum}
+
+hx <- st_read("Cities/Sao Paulo/sp_hex1000_data_MR.shp") %>%
+  filter(pop >= 0) %>%
+  mutate(GEO_ID = as.character(GEO_ID)) %>%
+  filter(CD_GEOCODM == "3550308")
+
+# Jobs
+jobs <- read.dbf("Cities/Sao Paulo/Banco de Dados/OD_2017.dbf") %>% 
+  filter(F_PESS == 1) %>%
+  filter(TRAB1_RE == 2) %>%
+  select(FE_PESS,CO_TR1_X,CO_TR1_Y) %>%
+  rename("X" = CO_TR1_X, "Y" = CO_TR1_Y) %>%
+  rbind(read.dbf("Cities/Sao Paulo/Banco de Dados/OD_2017.dbf") %>% 
+          filter(F_PESS == 1) %>%
+          filter(MUNI_DOM == 36) %>%
+          filter(TRAB2_RE == 2) %>%
+          select(FE_PESS,CO_TR2_X,CO_TR2_Y) %>%
+          rename("X" = CO_TR2_X, "Y" = CO_TR2_Y)) %>%
+  na.omit() %>%
+  st_as_sf(coords=c("X","Y"),remove=F,crs=22523) %>%
+  st_transform(4326) %>%
+  st_join(hx,join=st_within) %>%
+  st_drop_geometry() %>%
+  group_by(GEO_ID) %>%
+  summarise(jobs = sum(FE_PESS,na.rm=T))
+
+# Income
+socio <- read.csv("Cities/Sao Paulo/Basico_SP.csv",sep=";") %>%
+  rename("population" = V002,"income" = V009,"CD_GEOCODI"="Cod_setor") %>%
+  mutate(CD_GEOCODI = as.character(CD_GEOCODI))
+socio <- st_read("Cities/Sao Paulo/sp_ct_hex.shp")  %>%
+  mutate(CD_GEOCODI = as.character(CD_GEOCODI)) %>%
+  select(CD_GEOCODI,GEO_ID) %>%
+  mutate(area_polygon = as.numeric(st_area(.))) %>%
+  st_drop_geometry() %>%
+  select(CD_GEOCODI,GEO_ID,area_polygon) %>%
+  group_by(CD_GEOCODI) %>%
+  mutate(area_ct = sum(area_polygon,na.rm = T)) %>%
+  ungroup() %>%
+  left_join(socio,by="CD_GEOCODI") %>%
+  mutate(pop1 = population*area_polygon/area_ct) %>%
+  group_by(GEO_ID) %>%
+  summarize(pop = sum(pop1,na.rm = T),
+            income = sum(income*pop1,na.rm=T)/sum(pop1,na.rm=T)) %>%
+  ungroup() %>%
+  mutate(GEO_ID = as.character(GEO_ID)) %>%
+  mutate(income = income*(998/540))
+
+# Join travel time matrix with jobs database by destination
+hex <- read.csv("Cities/Sao Paulo/otp_output.csv") %>%
+  mutate(GEO_ID_i = as.character(fromPlace), GEO_ID_j = as.character(toPlace)) %>%
+  inner_join(st_read("Cities/Sao Paulo/sp_hex1000_data_MR.shp") %>%
+  filter(CD_GEOCODM == "3550308") %>%
+              st_drop_geometry() %>%
+              mutate(GEO_ID_i = GEO_ID) %>%
+               mutate(GEO_ID_i = as.character(GEO_ID_i)) %>%
+              select(GEO_ID_i), by="GEO_ID_i") %>%
+  inner_join(jobs %>%
+              mutate(GEO_ID_j = GEO_ID) %>%
+              select(GEO_ID_j,jobs), by="GEO_ID_j") %>%
+  inner_join(socio %>%
+              mutate(GEO_ID_i = GEO_ID) %>%
+              select(GEO_ID_i,pop,income), by="GEO_ID_i")  %>%
+  mutate(time = time/60,income=income/30) %>%
+  mutate(cost = 200*fare/income) %>%
+  filter(!is.na(cost))
+
+# Summary
+n_jobs <- hex %>% group_by(GEO_ID_j) %>% summarise(jobs = mean(jobs, na.rm = T)) %>% ungroup()
+n_jobs <- sum(n_jobs$jobs,na.rm=T)
+
+#n_pop <- 9354000 #PEA
+n_pop <- read.dbf("Cities/Sao Paulo/Banco de Dados/OD_2017.dbf") %>% 
+  filter(MUNI_DOM == 36) %>%
+  filter(F_PESS == 1) %>%
+  filter(IDADE >= 18) %>%
+  filter(IDADE <= 64)
+n_pop <- sum(n_pop$FE_PESS,na.rm=T)
+n_jobs/n_pop
+
+# Accessibility
+hex_ac <- hex %>%
+  mutate(time30 = ifelse(time <= 30,jobs,0),
+         time45 = ifelse(time <= 45,jobs,0),
+         time60 = ifelse(time <= 60,jobs,0),
+         time90 = ifelse(time <= 90,jobs,0),
+         time120 = ifelse(time <= 120,jobs,0),
+         board0 = ifelse(transfers <= 0,jobs,0),
+         board1 = ifelse(transfers <= 1,jobs,0),
+         board2 = ifelse(transfers <= 2,jobs,0),
+         board3 = ifelse(transfers <= 3,jobs,0),
+         board4 = ifelse(transfers <= 4,jobs,0),
+         cost10 = ifelse(cost <= 10,jobs,0),
+         cost20 = ifelse(cost <= 20,jobs,0),
+         cost30 = ifelse(cost <= 30,jobs,0),
+         cost40 = ifelse(cost <= 40,jobs,0),
+         cost5 = ifelse(cost <= 5,jobs,0),
+         cost25 = ifelse(cost <= 2.5,jobs,0)) %>%
+  mutate_at(c("time30","time45","time60","time90","time120","board0","board1","board2","board3","board4","cost10","cost20","cost30","cost40","cost5","cost25"),~(p = ./n_pop)) %>%
+  group_by(GEO_ID_i) %>%
+  summarise(time30 = sum(time30,na.rm=T),
+            time45 = sum(time45,na.rm = T),
+            time60 = sum(time60,na.rm=T),
+            time90 = sum(time90,na.rm=T),
+            time120 = sum(time120,na.rm=T),
+            board0 = sum(board0,na.rm=T),
+            board1 = sum(board1,na.rm = T),
+            board2 = sum(board2,na.rm=T),
+            board3 = sum(board3,na.rm=T),
+            board4 = sum(board4,na.rm=T),
+            cost10 = sum(cost10,na.rm=T),
+            cost20 = sum(cost20,na.rm = T),
+            cost30 = sum(cost30,na.rm=T),
+            cost40 = sum(cost40,na.rm=T),
+            cost5 = sum(cost5,na.rm=T),
+            cost25 = sum(cost25,na.rm=T))
+
+# Join with socioeconomic data
+access_shp <- st_read("Cities/Sao Paulo/sp_hex1000_data_MR.shp") %>%
+  select(GEO_ID,CD_GEOCODM) %>%
+  mutate(GEO_ID = as.character(GEO_ID)) %>%
+  mutate(GEO_ID_i=GEO_ID) %>%
+  inner_join(hex_ac, by = "GEO_ID_i") %>%
+  inner_join(jobs,by=c("GEO_ID_i"="GEO_ID")) %>%
+  inner_join(socio,by=c("GEO_ID_i"="GEO_ID")) %>%
+  select(-GEO_ID_i) %>%
+  filter(CD_GEOCODM == "3550308")
+
+st_write(access_shp,"Cities/Sao Paulo/sp_access_cum.shp", delete_layer = TRUE)
+
+```
+
+```{r sp_sim_cum}
+
+hx <- st_read("Cities/Sao Paulo/sp_hex1000_data_MR.shp")  %>%
+  filter(pop >= 0) %>%
+  mutate(GEO_ID = as.character(GEO_ID)) %>%
+  filter(CD_GEOCODM == "3550308")
+
+# Jobs
+jobs <- read.dbf("Cities/Sao Paulo/Banco de Dados/OD_2017.dbf") %>% 
+  filter(MUNI_DOM == 36) %>%
+  filter(F_PESS == 1) %>%
+  filter(TRAB1_RE == 2) %>%
+  select(FE_PESS,CO_TR1_X,CO_TR1_Y) %>%
+  rename("X" = CO_TR1_X, "Y" = CO_TR1_Y) %>%
+  rbind(read.dbf("Cities/Sao Paulo/Banco de Dados/OD_2017.dbf") %>% 
+          filter(F_PESS == 1) %>%
+          filter(MUNI_DOM == 36) %>%
+          filter(TRAB2_RE == 2) %>%
+          select(FE_PESS,CO_TR2_X,CO_TR2_Y) %>%
+          rename("X" = CO_TR2_X, "Y" = CO_TR2_Y)) %>%
+  na.omit() %>%
+  st_as_sf(coords=c("X","Y"),remove=F,crs=22523) %>%
+  st_transform(4326) %>%
+  st_join(hx,join=st_within) %>%
+  st_drop_geometry() %>%
+  group_by(GEO_ID) %>%
+  summarise(jobs = sum(FE_PESS,na.rm=T))
+
+# Income
+socio <- read.csv("Cities/Sao Paulo/Basico_SP.csv",sep=";") %>%
+  rename("population" = V002,"income" = V009,"CD_GEOCODI"="Cod_setor") %>%
+  mutate(CD_GEOCODI = as.character(CD_GEOCODI))
+socio <- st_read("Cities/Sao Paulo/sp_ct_hex.shp")  %>%
+  mutate(CD_GEOCODI = as.character(CD_GEOCODI)) %>%
+  select(CD_GEOCODI,GEO_ID) %>%
+  mutate(area_polygon = as.numeric(st_area(.))) %>%
+  st_drop_geometry() %>%
+  select(CD_GEOCODI,GEO_ID,area_polygon) %>%
+  group_by(CD_GEOCODI) %>%
+  mutate(area_ct = sum(area_polygon,na.rm = T)) %>%
+  ungroup() %>%
+  left_join(socio,by="CD_GEOCODI") %>%
+  mutate(pop1 = population*area_polygon/area_ct) %>%
+  group_by(GEO_ID) %>%
+  summarize(pop = sum(pop1,na.rm = T),
+            income = sum(income*pop1,na.rm=T)/sum(pop1,na.rm=T)) %>%
+  ungroup() %>%
+  mutate(GEO_ID = as.character(GEO_ID)) %>%
+  mutate(income = income*(998/540))
+
+# Join travel time matrix with jobs database by destination
+hex <- read.csv("Cities/Sao Paulo/otp_output.csv") %>%
+  mutate(GEO_ID_i = as.character(fromPlace), GEO_ID_j = as.character(toPlace)) %>%
+  inner_join(st_read("Cities/Sao Paulo/sp_hex1000_data_MR.shp") %>%
+  filter(CD_GEOCODM == "3550308") %>%
+              st_drop_geometry() %>%
+              mutate(GEO_ID_i = GEO_ID) %>%
+               mutate(GEO_ID_i = as.character(GEO_ID_i)) %>%
+              select(GEO_ID_i), by="GEO_ID_i") %>%
+  inner_join(jobs %>%
+              mutate(GEO_ID_j = GEO_ID) %>%
+              select(GEO_ID_j,jobs), by="GEO_ID_j") %>%
+  inner_join(socio %>%
+              mutate(GEO_ID_i = GEO_ID) %>%
+              select(GEO_ID_i,pop,income), by="GEO_ID_i")  %>%
+  mutate(time = time/60,income=income/30) %>%
+  mutate(cost = 200*fare/income) %>%
+  filter(!is.na(cost))
+
+# Summary
+n_jobs <- hex %>% group_by(GEO_ID_j) %>% summarise(jobs = mean(jobs, na.rm = T)) %>% ungroup()
+n_jobs <- sum(n_jobs$jobs,na.rm=T)
+
+#n_pop <- 9354000 #PEA
+n_pop <- read.dbf("Cities/Sao Paulo/Banco de Dados/OD_2017.dbf") %>% 
+  filter(MUNI_DOM == 36) %>%
+  filter(F_PESS == 1) %>%
+  filter(IDADE >= 18) %>%
+  filter(IDADE <= 64)
+n_pop <- sum(n_pop$FE_PESS,na.rm=T)
+n_jobs/n_pop
+
+# Accessibility
+hex_ac <- hex %>%
+  mutate(time30_10 = ifelse(time <= 30 & cost <= 10 & transfers <= 2,jobs,0),
+         time45_10 = ifelse(time <= 45 & cost <= 10 & transfers <= 2,jobs,0),
+         time60_10 = ifelse(time <= 60 & cost <= 10 & transfers <= 2,jobs,0),
+         time90_10 = ifelse(time <= 90 & cost <= 10 & transfers <= 2,jobs,0),
+         time120_10 = ifelse(time <= 120 & cost <= 10 & transfers <= 2,jobs,0),
+         time30_20 = ifelse(time <= 30 & cost <= 20 & transfers <= 2,jobs,0),
+         time45_20 = ifelse(time <= 45 & cost <= 20 & transfers <= 2,jobs,0),
+         time60_20 = ifelse(time <= 60 & cost <= 20 & transfers <= 2,jobs,0),
+         time90_20 = ifelse(time <= 90 & cost <= 20 & transfers <= 2,jobs,0),
+         time120_20 = ifelse(time <= 120 & cost <= 20 & transfers <= 2,jobs,0),
+         time30_30 = ifelse(time <= 30 & cost <= 30 & transfers <= 2,jobs,0),
+         time45_30 = ifelse(time <= 45 & cost <= 30 & transfers <= 2,jobs,0),
+         time60_30 = ifelse(time <= 60 & cost <= 30 & transfers <= 2,jobs,0),
+         time90_30 = ifelse(time <= 90 & cost <= 30 & transfers <= 2,jobs,0),
+         time120_30 = ifelse(time <= 120 & cost <= 30 & transfers <= 2,jobs,0)) %>%
+  group_by(GEO_ID_i) %>%
+  summarise(time30_10 = sum(time30_10,na.rm=T),
+            time45_10 = sum(time45_10,na.rm = T),
+            time60_10 = sum(time60_10,na.rm=T),
+            time90_10 = sum(time90_10,na.rm=T),
+            time120_10 = sum(time120_10,na.rm=T),
+            time30_20 = sum(time30_20,na.rm=T),
+            time45_20 = sum(time45_20,na.rm = T),
+            time60_20 = sum(time60_20,na.rm=T),
+            time90_20 = sum(time90_20,na.rm=T),
+            time120_20 = sum(time120_20,na.rm=T),
+            time30_30 = sum(time30_30,na.rm=T),
+            time45_30 = sum(time45_30,na.rm = T),
+            time60_30 = sum(time60_30,na.rm=T),
+            time90_30 = sum(time90_30,na.rm=T),
+            time120_30 = sum(time120_30,na.rm=T)) %>%
+  mutate_at(c("time30_10","time45_10","time60_10","time90_10","time120_10","time30_20","time45_20","time60_20","time90_20","time120_20","time30_30","time45_30","time60_30","time90_30","time120_30"),~(p = ./n_pop))
+
+# Join with socioeconomic data
+access_shp <- st_read("Cities/Sao Paulo/sp_hex1000_data_MR.shp")%>%
+  select(GEO_ID,CD_GEOCODM) %>%
+  mutate(GEO_ID = as.character(GEO_ID)) %>%
+  mutate(GEO_ID_i=GEO_ID) %>%
+  inner_join(hex_ac, by = "GEO_ID_i") %>%
+  inner_join(jobs,by=c("GEO_ID_i"="GEO_ID")) %>%
+  inner_join(socio,by=c("GEO_ID_i"="GEO_ID")) %>%
+  select(-GEO_ID_i) %>%
+  filter(CD_GEOCODM == "3550308")
+
+st_write(access_shp,"Cities/Sao Paulo/sp_access_sim_cum.shp", delete_layer = TRUE)
+```
+
+```{r nyc_access_cum}
+
+hx <- st_read("Cities/NYC/nyc_hex1000_MR.shp") %>%
+  mutate(GEO_ID = as.character(GEO_ID))
+
+# Jobs
+jobs <- read_csv("Cities/NYC/LINKED_Public.csv") %>% 
+  filter(OTPURP_AGG == "1") %>%
+  filter(DCOUNTY %in% c("36005","36047","36061","36081","36085")) %>%
+  group_by(DTRACT) %>%
+  summarise(jobs = sum(WHT_FAC3,na.rm=T)) %>%
+  mutate(D_TRACT = as.character(DTRACT))
+jobs <- st_read("Cities/NYC/nyc_ct_hex.shp") %>%
+  mutate(area_polygon = as.numeric(st_area(.))) %>%
+  st_drop_geometry() %>%
+  mutate(ct2010 = paste0(STATE,COUNTY,ct2010)) %>%
+  group_by(ct2010) %>%
+  mutate(area_ct  = sum(area_polygon,na.rm = T)) %>%
+  ungroup() %>%
+  left_join(jobs,by=c("ct2010"="D_TRACT")) %>%
+  mutate(jobs = jobs*area_polygon/area_ct) %>%
+  group_by(GEO_ID) %>%
+  summarise(jobs = sum(jobs,na.rm = T)) %>%
+  mutate(GEO_ID = as.character(GEO_ID)) 
+
+# Income
+socio <- st_read("Cities/NYC/nyc_censustracts.shp") %>% st_drop_geometry() %>%
+  mutate(ct2010 = paste0(STATE,COUNTY,ct2010)) %>%
+  select(ct2010) %>%
+  left_join(read_csv("Cities/NYC/income2018mod.csv",na = "N") %>%
+  mutate(ct2010 = substr(ct,10,30)),by="ct2010") %>%
+  select(-ct) %>%
+  mutate_all(as.numeric) %>%
+  mutate(ct2010 = as.character(ct2010))
+socio <- st_read("Cities/NYC/nyc_ct_hex.shp") %>%
+  mutate(area_polygon = as.numeric(st_area(.))) %>%
+  st_drop_geometry() %>%
+  mutate(ct2010 = paste0(STATE,COUNTY,ct2010)) %>%
+  group_by(ct2010) %>%
+  mutate(area_ct  = sum(area_polygon,na.rm = T)) %>%
+  ungroup() %>%
+  left_join(socio,by="ct2010") %>%
+  mutate(pop1 = num_hh*area_polygon/area_ct) %>%
+  group_by(GEO_ID) %>%
+  summarize(pop = sum(pop1,na.rm = T),
+            income = sum(pc_inc*pop1,na.rm=T)/sum(pop1,na.rm=T)) %>%
+  ungroup() %>%
+  mutate(GEO_ID = as.character(GEO_ID)) %>%
+  mutate(income = income*(8.50/7.35))
+
+# Join travel time matrix with jobs database by destination
+hex <- read.csv("Cities/NYC/nyc_otp_output.csv") %>%
+  mutate(GEO_ID_i = as.character(fromPlace), GEO_ID_j = as.character(toPlace)) %>%
+  inner_join(st_read("Cities/NYC/nyc_hex1000_MR.shp") %>%
+              st_drop_geometry() %>%
+              mutate(GEO_ID_i = GEO_ID) %>%
+               mutate(GEO_ID_i = as.character(GEO_ID_i)) %>%
+              select(GEO_ID_i), by="GEO_ID_i") %>%
+  inner_join(jobs %>%
+              mutate(GEO_ID_j = GEO_ID) %>%
+              select(GEO_ID_j,jobs), by="GEO_ID_j") %>%
+  inner_join(socio %>%
+              mutate(GEO_ID_i = GEO_ID) %>%
+              select(GEO_ID_i,pop,income), by="GEO_ID_i") %>%
+  mutate(time = time/60,income=income/365) %>%
+  mutate(cost = 200*fare/income) %>%
+  filter(!is.na(cost))
+
+# Summary
+n_jobs <- hex %>% group_by(GEO_ID_j) %>% summarise(jobs = mean(jobs, na.rm = T)) %>% ungroup()
+n_jobs <- sum(n_jobs$jobs,na.rm=T)
+
+n_pop <- 5980016 #18-64 2010
+
+n_jobs/n_pop
+
+# Accessibility
+hex_ac <- hex %>%
+  mutate(time30 = ifelse(time <= 30,jobs,0),
+         time45 = ifelse(time <= 45,jobs,0),
+         time60 = ifelse(time <= 60,jobs,0),
+         time90 = ifelse(time <= 90,jobs,0),
+         time120 = ifelse(time <= 120,jobs,0),
+         board0 = ifelse(transfers <= 0,jobs,0),
+         board1 = ifelse(transfers <= 1,jobs,0),
+         board2 = ifelse(transfers <= 2,jobs,0),
+         board3 = ifelse(transfers <= 3,jobs,0),
+         board4 = ifelse(transfers <= 4,jobs,0),
+         cost10 = ifelse(cost <= 10,jobs,0),
+         cost20 = ifelse(cost <= 20,jobs,0),
+         cost30 = ifelse(cost <= 30,jobs,0),
+         cost40 = ifelse(cost <= 40,jobs,0),
+         cost5 = ifelse(cost <= 5,jobs,0),
+         cost25 = ifelse(cost <= 2.5,jobs,0)) %>%
+  group_by(GEO_ID_i) %>%
+  summarise(time30 = sum(time30,na.rm=T),
+            time45 = sum(time45,na.rm = T),
+            time60 = sum(time60,na.rm=T),
+            time90 = sum(time90,na.rm=T),
+            time120 = sum(time120,na.rm=T),
+            board0 = sum(board0,na.rm=T),
+            board1 = sum(board1,na.rm = T),
+            board2 = sum(board2,na.rm=T),
+            board3 = sum(board3,na.rm=T),
+            board4 = sum(board4,na.rm=T),
+            cost10 = sum(cost10,na.rm=T),
+            cost20 = sum(cost20,na.rm = T),
+            cost30 = sum(cost30,na.rm=T),
+            cost40 = sum(cost40,na.rm=T),
+            cost5 = sum(cost5,na.rm=T),
+            cost25 = sum(cost25,na.rm=T)) %>%
+  mutate_at(c("time30","time45","time60","time90","time120","board0","board1","board2","board3","board4","cost10","cost20","cost30","cost40","cost5","cost25"),~(p = ./n_pop))
+
+# Join with socioeconomic data
+access_shp <- st_read("Cities/NYC/nyc_hex1000_MR.shp") %>%
+  mutate(GEO_ID = as.character(GEO_ID)) %>%
+  mutate(GEO_ID_i=GEO_ID) %>%
+  inner_join(hex_ac, by = "GEO_ID_i") %>%
+  inner_join(jobs,by=c("GEO_ID_i"="GEO_ID")) %>%
+  inner_join(socio,by=c("GEO_ID_i"="GEO_ID")) %>%
+  select(-GEO_ID_i)
+
+st_write(access_shp,"Cities/NYC/nyc_access_cum.shp", delete_layer = TRUE)
+
+```
+
+```{r nyc_sim_cum}
+
+hx <- st_read("Cities/NYC/nyc_hex1000_MR.shp") %>%
+  mutate(GEO_ID = as.character(GEO_ID))
+
+jobs <- read_csv("Cities/NYC/LINKED_Public.csv") %>% 
+  filter(OTPURP_AGG == "1") %>%
+  filter(DCOUNTY %in% c("36005","36047","36061","36081","36085")) %>%
+  group_by(DTRACT) %>%
+  summarise(jobs = sum(WHT_FAC3,na.rm=T)) %>%
+  mutate(D_TRACT = as.character(DTRACT))
+jobs <- st_read("Cities/NYC/nyc_ct_hex.shp") %>%
+  mutate(area_polygon = as.numeric(st_area(.))) %>%
+  st_drop_geometry() %>%
+  mutate(ct2010 = paste0(STATE,COUNTY,ct2010)) %>%
+  group_by(ct2010) %>%
+  mutate(area_ct  = sum(area_polygon,na.rm = T)) %>%
+  ungroup() %>%
+  left_join(jobs,by=c("ct2010"="D_TRACT")) %>%
+  mutate(jobs = jobs*area_polygon/area_ct) %>%
+  group_by(GEO_ID) %>%
+  summarise(jobs = sum(jobs,na.rm = T)) %>%
+  mutate(GEO_ID = as.character(GEO_ID)) 
+
+# Income
+socio <- st_read("Cities/NYC/nyc_censustracts.shp") %>% st_drop_geometry() %>%
+  mutate(ct2010 = paste0(STATE,COUNTY,ct2010)) %>%
+  select(ct2010) %>%
+  left_join(read_csv("Cities/NYC/income2018mod.csv",na = "N") %>%
+  mutate(ct2010 = substr(ct,10,30)),by="ct2010") %>%
+  select(-ct) %>%
+  mutate_all(as.numeric) %>%
+  mutate(ct2010 = as.character(ct2010))
+socio <- st_read("Cities/NYC/nyc_ct_hex.shp") %>%
+  mutate(area_polygon = as.numeric(st_area(.))) %>%
+  st_drop_geometry() %>%
+  mutate(ct2010 = paste0(STATE,COUNTY,ct2010)) %>%
+  group_by(ct2010) %>%
+  mutate(area_ct  = sum(area_polygon,na.rm = T)) %>%
+  ungroup() %>%
+  left_join(socio,by="ct2010") %>%
+  mutate(pop1 = num_hh*area_polygon/area_ct) %>%
+  group_by(GEO_ID) %>%
+  summarize(pop = sum(pop1,na.rm = T),
+            income = sum(pc_inc*pop1,na.rm=T)/sum(pop1,na.rm=T)) %>%
+  ungroup() %>%
+  mutate(GEO_ID = as.character(GEO_ID)) %>%
+  mutate(income = income*(8.50/7.35))
+
+# Join travel time matrix with jobs database by destination
+hex <- read.csv("Cities/NYC/nyc_otp_output.csv") %>%
+  mutate(GEO_ID_i = as.character(fromPlace), GEO_ID_j = as.character(toPlace)) %>%
+  inner_join(st_read("Cities/NYC/nyc_hex1000_MR.shp") %>%
+              st_drop_geometry() %>%
+              mutate(GEO_ID_i = GEO_ID) %>%
+               mutate(GEO_ID_i = as.character(GEO_ID_i)) %>%
+              select(GEO_ID_i), by="GEO_ID_i") %>%
+  inner_join(jobs %>%
+              mutate(GEO_ID_j = GEO_ID) %>%
+              select(GEO_ID_j,jobs), by="GEO_ID_j") %>%
+  inner_join(socio %>%
+              mutate(GEO_ID_i = GEO_ID) %>%
+              select(GEO_ID_i,pop,income), by="GEO_ID_i") %>%
+  mutate(time = time/60,income=income/365) %>%
+  mutate(cost = 200*fare/income) %>%
+  filter(!is.na(cost))
+
+
+# Summary
+n_jobs <- hex %>% group_by(GEO_ID_j) %>% summarise(jobs = mean(jobs, na.rm = T)) %>% ungroup()
+n_jobs <- sum(n_jobs$jobs,na.rm=T)
+
+n_pop <- 5980016 #18-64 2010
+
+n_jobs/n_pop
+
+
+# Accessibility
+hex_ac <- hex %>%
+  mutate(time30_10 = ifelse(time <= 30 & cost <= 10 & transfers <= 2,jobs,0),
+         time45_10 = ifelse(time <= 45 & cost <= 10 & transfers <= 2,jobs,0),
+         time60_10 = ifelse(time <= 60 & cost <= 10 & transfers <= 2,jobs,0),
+         time90_10 = ifelse(time <= 90 & cost <= 10 & transfers <= 2,jobs,0),
+         time120_10 = ifelse(time <= 120 & cost <= 10 & transfers <= 2,jobs,0),
+         time30_20 = ifelse(time <= 30 & cost <= 20 & transfers <= 2,jobs,0),
+         time45_20 = ifelse(time <= 45 & cost <= 20 & transfers <= 2,jobs,0),
+         time60_20 = ifelse(time <= 60 & cost <= 20 & transfers <= 2,jobs,0),
+         time90_20 = ifelse(time <= 90 & cost <= 20 & transfers <= 2,jobs,0),
+         time120_20 = ifelse(time <= 120 & cost <= 20 & transfers <= 2,jobs,0),
+         time30_30 = ifelse(time <= 30 & cost <= 30 & transfers <= 2,jobs,0),
+         time45_30 = ifelse(time <= 45 & cost <= 30 & transfers <= 2,jobs,0),
+         time60_30 = ifelse(time <= 60 & cost <= 30 & transfers <= 2,jobs,0),
+         time90_30 = ifelse(time <= 90 & cost <= 30 & transfers <= 2,jobs,0),
+         time120_30 = ifelse(time <= 120 & cost <= 30 & transfers <= 2,jobs,0)) %>%
+  group_by(GEO_ID_i) %>%
+  summarise(time30_10 = sum(time30_10,na.rm=T),
+            time45_10 = sum(time45_10,na.rm = T),
+            time60_10 = sum(time60_10,na.rm=T),
+            time90_10 = sum(time90_10,na.rm=T),
+            time120_10 = sum(time120_10,na.rm=T),
+            time30_20 = sum(time30_20,na.rm=T),
+            time45_20 = sum(time45_20,na.rm = T),
+            time60_20 = sum(time60_20,na.rm=T),
+            time90_20 = sum(time90_20,na.rm=T),
+            time120_20 = sum(time120_20,na.rm=T),
+            time30_30 = sum(time30_30,na.rm=T),
+            time45_30 = sum(time45_30,na.rm = T),
+            time60_30 = sum(time60_30,na.rm=T),
+            time90_30 = sum(time90_30,na.rm=T),
+            time120_30 = sum(time120_30,na.rm=T)) %>%
+  mutate_at(c("time30_10","time45_10","time60_10","time90_10","time120_10","time30_20","time45_20","time60_20","time90_20","time120_20","time30_30","time45_30","time60_30","time90_30","time120_30"),~(p = ./n_pop))
+
+# Join with socioeconomic data
+access_shp <- st_read("Cities/NYC/nyc_hex1000_MR.shp")%>%
+  mutate(GEO_ID = as.character(GEO_ID)) %>%
+  mutate(GEO_ID_i=GEO_ID) %>%
+  inner_join(hex_ac, by = "GEO_ID_i") %>%
+  inner_join(jobs,by=c("GEO_ID_i"="GEO_ID")) %>%
+  inner_join(socio,by=c("GEO_ID_i"="GEO_ID")) %>%
+  select(-GEO_ID_i)
+
+st_write(access_shp,"Cities/NYC/nyc_access_sim_cum.shp", delete_layer = TRUE)
+
+```
+
+```{r lon_access_cum}
+
+hx <- st_read("Cities/London/lon_hex1000_MR.shp") %>%
+  mutate(GEO_ID = as.character(GEO_ID))
+
+# Jobs
+jobs <- read.csv("Cities/London/wu01ew_v2.csv",sep=",") %>%
+  group_by(Area.of.workplace) %>%
+  summarise(workplaceP = sum(All.categories..Sex,na.rm=T)) %>%
+  mutate(code = Area.of.workplace) %>%
+  select(code,workplaceP)
+jobs <- st_read("Cities/London/lon_MSOA_hex.shp") %>%
+  mutate(area_polygon = as.numeric(st_area(.))) %>%
+  st_drop_geometry() %>%
+  mutate(code=CODE) %>%
+  select(code,GEO_ID,area_polygon) %>%
+  group_by(code) %>%
+  mutate(area_ct  = sum(area_polygon,na.rm = T)) %>%
+  ungroup() %>%
+  left_join(jobs,by="code") %>%
+  mutate(jobs = workplaceP*area_polygon/area_ct) %>%
+  group_by(GEO_ID) %>%
+  summarise(jobs = sum(jobs,na.rm = T)) %>%
+  mutate(GEO_ID = as.character(GEO_ID)) 
+
+
+# Income
+socio <- read.csv("Cities/London/modelled-household-income-estimates-lsoa.csv",sep=";") %>%
+  left_join(read.csv("Cities/London/Data_UNIT_URESPOP.csv",sep=";"),by=c("Code"="GEO_CODE")) %>%
+  mutate(income=(Mean.2012.13*Households)/Population.in.Households) %>%
+  select(Code,income,Population)
+socio <- st_read("Cities/London/lon_LSOA_hex.shp") %>%
+  select(LSOA11CD,GEO_ID) %>%
+  rename("Code" = LSOA11CD) %>%
+  mutate(area_polygon = as.numeric(st_area(.))) %>%
+  st_drop_geometry() %>%
+  select(Code,GEO_ID,area_polygon) %>%
+  group_by(Code) %>%
+  mutate(area_ct  = sum(area_polygon,na.rm = T)) %>%
+  ungroup() %>%
+  left_join(socio,by="Code") %>%
+  mutate(pop1 = Population*area_polygon/area_ct) %>%
+  group_by(GEO_ID) %>%
+  summarize(pop = sum(pop1,na.rm = T),
+            income = sum(income*pop1,na.rm=T)/sum(pop1,na.rm=T)) %>%
+  ungroup() %>%
+  mutate(GEO_ID = as.character(GEO_ID)) %>%
+  mutate(income = income*(8.21/6.08))
+
+# Join travel time matrix with jobs database by destination
+hex <- read.csv("Cities/London/lon_otp_output.csv") %>%
+  mutate(GEO_ID_i = as.character(fromPlace), GEO_ID_j = as.character(toPlace)) %>%
+  inner_join(st_read("Cities/London/lon_hex1000_MR.shp") %>%
+              st_drop_geometry() %>%
+              mutate(GEO_ID_i = GEO_ID) %>%
+               mutate(GEO_ID_i = as.character(GEO_ID_i)) %>%
+              select(GEO_ID_i), by="GEO_ID_i") %>%
+  inner_join(jobs %>%
+              mutate(GEO_ID_j = GEO_ID) %>%
+              select(GEO_ID_j,jobs), by="GEO_ID_j") %>%
+  inner_join(socio %>%
+              mutate(GEO_ID_i = GEO_ID) %>%
+              select(GEO_ID_i,pop,income), by="GEO_ID_i")  %>%
+  mutate(time = time/60,income=income/365) %>%
+  mutate(cost = 200*fare/income) %>%
+  filter(!is.na(cost))
+
+# Summary
+n_jobs <- hex %>% group_by(GEO_ID_j) %>% summarise(jobs = mean(jobs, na.rm = T)) %>% ungroup()
+n_jobs <- sum(n_jobs$jobs,na.rm=T)
+
+#n_pop <- 6388233 #PEA 
+n_pop <- read.csv("Cities/London/Data_AGE_UNIT.csv",sep=",") %>%
+  mutate(pop = F70+F174+F175+F176+F177+F178+F179,
+         code = GEO_CODE) %>%
+  select(code,pop)
+n_pop <- st_read("Cities/London/lon_MSOA_hex.shp") %>%
+  mutate(area_polygon = as.numeric(st_area(.))) %>%
+  st_drop_geometry() %>%
+  mutate(code=CODE) %>%
+  select(code,GEO_ID,area_polygon) %>%
+  group_by(code) %>%
+  mutate(area_ct  = sum(area_polygon,na.rm = T)) %>%
+  ungroup() %>%
+  left_join(n_pop,by="code") %>%
+  mutate(pop = pop*area_polygon/area_ct) %>%
+  group_by(GEO_ID) %>%
+  summarise(pop = sum(pop,na.rm = T)) %>%
+  mutate(GEO_ID = as.character(GEO_ID)) 
+n_pop <- sum(n_pop$pop,na.rm=T)
+
+n_jobs/n_pop
+
+# Accessibility
+hex_ac <- hex %>%
+  mutate(time30 = ifelse(time <= 30,jobs,0),
+         time45 = ifelse(time <= 45,jobs,0),
+         time60 = ifelse(time <= 60,jobs,0),
+         time90 = ifelse(time <= 90,jobs,0),
+         time120 = ifelse(time <= 120,jobs,0),
+         board0 = ifelse(transfers <= 0,jobs,0),
+         board1 = ifelse(transfers <= 1,jobs,0),
+         board2 = ifelse(transfers <= 2,jobs,0),
+         board3 = ifelse(transfers <= 3,jobs,0),
+         board4 = ifelse(transfers <= 4,jobs,0),
+         cost10 = ifelse(cost <= 10,jobs,0),
+         cost20 = ifelse(cost <= 20,jobs,0),
+         cost30 = ifelse(cost <= 30,jobs,0),
+         cost40 = ifelse(cost <= 40,jobs,0),
+         cost5 = ifelse(cost <= 5,jobs,0),
+         cost25 = ifelse(cost <= 2.5,jobs,0)) %>%
+  group_by(GEO_ID_i) %>%
+  summarise(time30 = sum(time30,na.rm=T),
+            time45 = sum(time45,na.rm = T),
+            time60 = sum(time60,na.rm=T),
+            time90 = sum(time90,na.rm=T),
+            time120 = sum(time120,na.rm=T),
+            board0 = sum(board0,na.rm=T),
+            board1 = sum(board1,na.rm = T),
+            board2 = sum(board2,na.rm=T),
+            board3 = sum(board3,na.rm=T),
+            board4 = sum(board4,na.rm=T),
+            cost10 = sum(cost10,na.rm=T),
+            cost20 = sum(cost20,na.rm = T),
+            cost30 = sum(cost30,na.rm=T),
+            cost40 = sum(cost40,na.rm=T),
+            cost5 = sum(cost5,na.rm=T),
+            cost25 = sum(cost25,na.rm=T)) %>%
+  mutate_at(c("time30","time45","time60","time90","time120","board0","board1","board2","board3","board4","cost10","cost20","cost30","cost40","cost5","cost25"),~(p = ./n_pop))
+
+# Join with socioeconomic data
+access_shp <- st_read("Cities/London/lon_hex1000_MR.shp") %>%
+  mutate(GEO_ID = as.character(GEO_ID)) %>%
+  mutate(GEO_ID_i=GEO_ID) %>%
+  inner_join(hex_ac, by = "GEO_ID_i") %>%
+  inner_join(jobs,by=c("GEO_ID_i"="GEO_ID")) %>%
+  inner_join(socio,by=c("GEO_ID_i"="GEO_ID")) %>%
+  select(-GEO_ID_i)
+
+st_write(access_shp,"Cities/London/lon_access_cum.shp", delete_layer = TRUE)
+
+```
+
+```{r lon_sim_cum}
+
+hx <- st_read("Cities/London/lon_hex1000_MR.shp") %>%
+  mutate(GEO_ID = as.character(GEO_ID))
+
+# Jobs
+jobs <- read.csv("Cities/London/wu01ew_v2.csv",sep=",") %>%
+  group_by(Area.of.workplace) %>%
+  summarise(workplaceP = sum(All.categories..Sex,na.rm=T)) %>%
+  mutate(code = Area.of.workplace) %>%
+  select(code,workplaceP)
+jobs <- st_read("Cities/London/lon_MSOA_hex.shp") %>%
+  mutate(area_polygon = as.numeric(st_area(.))) %>%
+  st_drop_geometry() %>%
+  mutate(code=CODE) %>%
+  select(code,GEO_ID,area_polygon) %>%
+  group_by(code) %>%
+  mutate(area_ct  = sum(area_polygon,na.rm = T)) %>%
+  ungroup() %>%
+  left_join(jobs,by="code") %>%
+  mutate(jobs = workplaceP*area_polygon/area_ct) %>%
+  group_by(GEO_ID) %>%
+  summarise(jobs = sum(jobs,na.rm = T)) %>%
+  mutate(GEO_ID = as.character(GEO_ID)) 
+
+# Income
+socio <- read.csv("Cities/London/modelled-household-income-estimates-lsoa.csv",sep=";") %>%
+  left_join(read.csv("Cities/London/Data_UNIT_URESPOP.csv",sep=";"),by=c("Code"="GEO_CODE")) %>%
+  mutate(income=(Mean.2012.13*Households)/Population.in.Households) %>%
+  select(Code,income,Population)
+socio <- st_read("Cities/London/lon_LSOA_hex.shp") %>%
+  select(LSOA11CD,GEO_ID) %>%
+  rename("Code" = LSOA11CD) %>%
+  mutate(area_polygon = as.numeric(st_area(.))) %>%
+  st_drop_geometry() %>%
+  select(Code,GEO_ID,area_polygon) %>%
+  group_by(Code) %>%
+  mutate(area_ct  = sum(area_polygon,na.rm = T)) %>%
+  ungroup() %>%
+  left_join(socio,by="Code") %>%
+  mutate(pop1 = Population*area_polygon/area_ct) %>%
+  group_by(GEO_ID) %>%
+  summarize(pop = sum(pop1,na.rm = T),
+            income = sum(income*pop1,na.rm=T)/sum(pop1,na.rm=T)) %>%
+  ungroup() %>%
+  mutate(GEO_ID = as.character(GEO_ID)) %>%
+  mutate(income = income*(8.21/6.08))
+
+
+# Join travel time matrix with jobs database by destination
+hex <- read.csv("Cities/London/lon_otp_output.csv") %>%
+  mutate(GEO_ID_i = as.character(fromPlace), GEO_ID_j = as.character(toPlace)) %>%
+  inner_join(st_read("Cities/London/lon_hex1000_MR.shp") %>%
+              st_drop_geometry() %>%
+              mutate(GEO_ID_i = GEO_ID) %>%
+               mutate(GEO_ID_i = as.character(GEO_ID_i)) %>%
+              select(GEO_ID_i), by="GEO_ID_i") %>%
+  inner_join(jobs %>%
+              mutate(GEO_ID_j = GEO_ID) %>%
+              select(GEO_ID_j,jobs), by="GEO_ID_j") %>%
+  inner_join(socio %>%
+              mutate(GEO_ID_i = GEO_ID) %>%
+              select(GEO_ID_i,pop,income), by="GEO_ID_i")  %>%
+  mutate(time = time/60,income=income/365) %>%
+  mutate(cost = 200*fare/income) %>%
+  filter(!is.na(cost))
+
+# Summary
+n_jobs <- hex %>% group_by(GEO_ID_j) %>% summarise(jobs = mean(jobs, na.rm = T)) %>% ungroup()
+n_jobs <- sum(n_jobs$jobs,na.rm=T)
+
+n_pop <- read.csv("Cities/London/Data_AGE_UNIT.csv",sep=",") %>%
+  mutate(pop = F70+F174+F175+F176+F177+F178+F179,
+         code = GEO_CODE) %>%
+  select(code,pop)
+n_pop <- st_read("Cities/London/lon_MSOA_hex.shp") %>%
+  mutate(area_polygon = as.numeric(st_area(.))) %>%
+  st_drop_geometry() %>%
+  mutate(code=CODE) %>%
+  select(code,GEO_ID,area_polygon) %>%
+  group_by(code) %>%
+  mutate(area_ct  = sum(area_polygon,na.rm = T)) %>%
+  ungroup() %>%
+  left_join(n_pop,by="code") %>%
+  mutate(pop = pop*area_polygon/area_ct) %>%
+  group_by(GEO_ID) %>%
+  summarise(pop = sum(pop,na.rm = T)) %>%
+  mutate(GEO_ID = as.character(GEO_ID)) 
+n_pop <- sum(n_pop$pop,na.rm=T)
+
+n_jobs/n_pop
+
+# Step 1 - destinations
+hex_ac <- hex %>%
+  mutate(time30_10 = ifelse(time <= 30 & cost <= 10 & transfers <= 2,jobs,0),
+         time45_10 = ifelse(time <= 45 & cost <= 10 & transfers <= 2,jobs,0),
+         time60_10 = ifelse(time <= 60 & cost <= 10 & transfers <= 2,jobs,0),
+         time90_10 = ifelse(time <= 90 & cost <= 10 & transfers <= 2,jobs,0),
+         time120_10 = ifelse(time <= 120 & cost <= 10 & transfers <= 2,jobs,0),
+         time30_20 = ifelse(time <= 30 & cost <= 20 & transfers <= 2,jobs,0),
+         time45_20 = ifelse(time <= 45 & cost <= 20 & transfers <= 2,jobs,0),
+         time60_20 = ifelse(time <= 60 & cost <= 20 & transfers <= 2,jobs,0),
+         time90_20 = ifelse(time <= 90 & cost <= 20 & transfers <= 2,jobs,0),
+         time120_20 = ifelse(time <= 120 & cost <= 20 & transfers <= 2,jobs,0),
+         time30_30 = ifelse(time <= 30 & cost <= 30 & transfers <= 2,jobs,0),
+         time45_30 = ifelse(time <= 45 & cost <= 30 & transfers <= 2,jobs,0),
+         time60_30 = ifelse(time <= 60 & cost <= 30 & transfers <= 2,jobs,0),
+         time90_30 = ifelse(time <= 90 & cost <= 30 & transfers <= 2,jobs,0),
+         time120_30 = ifelse(time <= 120 & cost <= 30 & transfers <= 2,jobs,0)) %>%
+  group_by(GEO_ID_i) %>%
+  summarise(time30_10 = sum(time30_10,na.rm=T),
+            time45_10 = sum(time45_10,na.rm = T),
+            time60_10 = sum(time60_10,na.rm=T),
+            time90_10 = sum(time90_10,na.rm=T),
+            time120_10 = sum(time120_10,na.rm=T),
+            time30_20 = sum(time30_20,na.rm=T),
+            time45_20 = sum(time45_20,na.rm = T),
+            time60_20 = sum(time60_20,na.rm=T),
+            time90_20 = sum(time90_20,na.rm=T),
+            time120_20 = sum(time120_20,na.rm=T),
+            time30_30 = sum(time30_30,na.rm=T),
+            time45_30 = sum(time45_30,na.rm = T),
+            time60_30 = sum(time60_30,na.rm=T),
+            time90_30 = sum(time90_30,na.rm=T),
+            time120_30 = sum(time120_30,na.rm=T)) %>%
+  mutate_at(c("time30_10","time45_10","time60_10","time90_10","time120_10","time30_20","time45_20","time60_20","time90_20","time120_20","time30_30","time45_30","time60_30","time90_30","time120_30"),~(p = ./n_pop))
+
+# Join with socioeconomic data
+access_shp <- st_read("Cities/London/lon_hex1000_MR.shp") %>%
+  mutate(GEO_ID = as.character(GEO_ID)) %>%
+  mutate(GEO_ID_i=GEO_ID) %>%
+  inner_join(hex_ac, by = "GEO_ID_i") %>%
+  inner_join(jobs,by=c("GEO_ID_i"="GEO_ID")) %>%
+  inner_join(socio,by=c("GEO_ID_i"="GEO_ID")) %>%
+  select(-GEO_ID_i)
+
+st_write(access_shp,"Cities/London/lon_access_sim_cum.shp", delete_layer = TRUE)
+
+```
+
+```{r access_gini}
+
+access <- st_read("Cities/Sao Paulo/sp_access_cum.shp") %>%
+  st_drop_geometry()
+access_sim <- st_read("Cities/Sao Paulo/sp_access_sim_cum.shp") %>%
+  st_drop_geometry()
+
+# Gini
+gini_sp <- tibble(
+  dimension = c(rep("Time",5),rep("Cost",5),rep("Transfers",5),rep("Time10",5),rep("Time20",5),rep("Time30",5)),
+  metric = c(30,45,60,90,120,5,10,20,30,40,0,1,2,3,4,30,45,60,90,120,30,45,60,90,120,30,45,60,90,120),
+  gini = c(Gini(access$time30,access$pop,na.rm = T),
+           Gini(access$time45,access$pop,na.rm=T),
+           Gini(access$time60,access$pop,na.rm=T),
+           Gini(access$time90,access$pop,na.rm=T),
+           Gini(access$time120,access$pop,na.rm=T),
+           Gini(access$cost5,access$pop,na.rm = T),
+           Gini(access$cost10,access$pop,na.rm=T),
+           Gini(access$cost20,access$pop,na.rm=T),
+           Gini(access$cost30,access$pop,na.rm=T),
+           Gini(access$cost40,access$pop,na.rm=T),
+           Gini(access$board0,access$pop,na.rm = T),
+           Gini(access$board1,access$pop,na.rm=T),
+           Gini(access$board2,access$pop,na.rm=T),
+           Gini(access$board3,access$pop,na.rm=T),
+           Gini(access$board4,access$pop,na.rm=T),
+           Gini(access_sim$time30_10,access_sim$pop,na.rm = T),
+           Gini(access_sim$time45_10,access_sim$pop,na.rm=T),
+           Gini(access_sim$time60_10,access_sim$pop,na.rm=T),
+           Gini(access_sim$time90_10,access_sim$pop,na.rm=T),
+           Gini(access_sim$time120_10,access_sim$pop,na.rm=T),
+           Gini(access_sim$time30_20,access_sim$pop,na.rm = T),
+           Gini(access_sim$time45_20,access_sim$pop,na.rm=T),
+           Gini(access_sim$time60_20,access_sim$pop,na.rm=T),
+           Gini(access_sim$time90_20,access_sim$pop,na.rm=T),
+           Gini(access_sim$time120_20,access_sim$pop,na.rm=T),
+           Gini(access_sim$time30_30,access_sim$pop,na.rm = T),
+           Gini(access_sim$time45_30,access_sim$pop,na.rm=T),
+           Gini(access_sim$time60_30,access_sim$pop,na.rm=T),
+           Gini(access_sim$time90_30,access_sim$pop,na.rm=T),
+           Gini(access_sim$time120_30,access_sim$pop,na.rm=T)))
+
+
+access <- st_read("Cities/NYC/nyc_access_cum.shp") %>%
+  st_drop_geometry()
+access_sim <- st_read("Cities/NYC/nyc_access_sim_cum.shp") %>%
+  st_drop_geometry()
+
+# Gini
+gini_nyc <- tibble(
+  dimension = c(rep("Time",5),rep("Cost",5),rep("Transfers",5),rep("Time10",5),rep("Time20",5),rep("Time30",5)),
+  metric = c(30,45,60,90,120,5,10,20,30,40,0,1,2,3,4,30,45,60,90,120,30,45,60,90,120,30,45,60,90,120),
+  gini = c(Gini(access$time30,access$pop,na.rm = T),
+           Gini(access$time45,access$pop,na.rm=T),
+           Gini(access$time60,access$pop,na.rm=T),
+           Gini(access$time90,access$pop,na.rm=T),
+           Gini(access$time120,access$pop,na.rm=T),
+           Gini(access$cost5,access$pop,na.rm = T),
+           Gini(access$cost10,access$pop,na.rm=T),
+           Gini(access$cost20,access$pop,na.rm=T),
+           Gini(access$cost30,access$pop,na.rm=T),
+           Gini(access$cost40,access$pop,na.rm=T),
+           Gini(access$board0,access$pop,na.rm = T),
+           Gini(access$board1,access$pop,na.rm=T),
+           Gini(access$board2,access$pop,na.rm=T),
+           Gini(access$board3,access$pop,na.rm=T),
+           Gini(access$board4,access$pop,na.rm=T),
+           Gini(access_sim$time30_10,access_sim$pop,na.rm = T),
+           Gini(access_sim$time45_10,access_sim$pop,na.rm=T),
+           Gini(access_sim$time60_10,access_sim$pop,na.rm=T),
+           Gini(access_sim$time90_10,access_sim$pop,na.rm=T),
+           Gini(access_sim$time120_10,access_sim$pop,na.rm=T),
+           Gini(access_sim$time30_20,access_sim$pop,na.rm = T),
+           Gini(access_sim$time45_20,access_sim$pop,na.rm=T),
+           Gini(access_sim$time60_20,access_sim$pop,na.rm=T),
+           Gini(access_sim$time90_20,access_sim$pop,na.rm=T),
+           Gini(access_sim$time120_20,access_sim$pop,na.rm=T),
+           Gini(access_sim$time30_30,access_sim$pop,na.rm = T),
+           Gini(access_sim$time45_30,access_sim$pop,na.rm=T),
+           Gini(access_sim$time60_30,access_sim$pop,na.rm=T),
+           Gini(access_sim$time90_30,access_sim$pop,na.rm=T),
+           Gini(access_sim$time120_30,access_sim$pop,na.rm=T)))
+  
+access <- st_read("Cities/London/lon_access_cum.shp") %>%
+  st_drop_geometry()
+access_sim <- st_read("Cities/London/lon_access_sim_cum.shp") %>%
+  st_drop_geometry()
+
+# Gini
+gini_lon <- tibble(
+  dimension = c(rep("Time",5),rep("Cost",5),rep("Transfers",5),rep("Time10",5),rep("Time20",5),rep("Time30",5)),
+  metric = c(30,45,60,90,120,5,10,20,30,40,0,1,2,3,4,30,45,60,90,120,30,45,60,90,120,30,45,60,90,120),
+  gini = c(Gini(access$time30,access$pop,na.rm = T),
+           Gini(access$time45,access$pop,na.rm=T),
+           Gini(access$time60,access$pop,na.rm=T),
+           Gini(access$time90,access$pop,na.rm=T),
+           Gini(access$time120,access$pop,na.rm=T),
+           Gini(access$cost5,access$pop,na.rm = T),
+           Gini(access$cost10,access$pop,na.rm=T),
+           Gini(access$cost20,access$pop,na.rm=T),
+           Gini(access$cost30,access$pop,na.rm=T),
+           Gini(access$cost40,access$pop,na.rm=T),
+           Gini(access$board0,access$pop,na.rm = T),
+           Gini(access$board1,access$pop,na.rm=T),
+           Gini(access$board2,access$pop,na.rm=T),
+           Gini(access$board3,access$pop,na.rm=T),
+           Gini(access$board4,access$pop,na.rm=T),
+           Gini(access_sim$time30_10,access_sim$pop,na.rm = T),
+           Gini(access_sim$time45_10,access_sim$pop,na.rm=T),
+           Gini(access_sim$time60_10,access_sim$pop,na.rm=T),
+           Gini(access_sim$time90_10,access_sim$pop,na.rm=T),
+           Gini(access_sim$time120_10,access_sim$pop,na.rm=T),
+           Gini(access_sim$time30_20,access_sim$pop,na.rm = T),
+           Gini(access_sim$time45_20,access_sim$pop,na.rm=T),
+           Gini(access_sim$time60_20,access_sim$pop,na.rm=T),
+           Gini(access_sim$time90_20,access_sim$pop,na.rm=T),
+           Gini(access_sim$time120_20,access_sim$pop,na.rm=T),
+           Gini(access_sim$time30_30,access_sim$pop,na.rm = T),
+           Gini(access_sim$time45_30,access_sim$pop,na.rm=T),
+           Gini(access_sim$time60_30,access_sim$pop,na.rm=T),
+           Gini(access_sim$time90_30,access_sim$pop,na.rm=T),
+           Gini(access_sim$time120_30,access_sim$pop,na.rm=T)))
+
+gini <- gini_sp %>% mutate(City = "São Paulo") %>% rbind(gini_nyc %>% mutate(City = "New York City")) %>% rbind(gini_lon %>% mutate(City = "London")) %>%
+  mutate(dimension = factor(dimension,levels=c("Time","Cost","Transfers","Time10","Time20","Time30"))) %>% arrange(dimension) %>%
+mutate(City = factor(City,levels=c("São Paulo","New York City","London"))) %>%
+  mutate(metric=factor(as.character(metric),levels=c("0","1","2","3","4","5","10","20","30","40","45","60","90","120"))) %>%
+  filter(dimension %in% c("Time","Cost","Transfers","Time20"))
+
+gini %>%
+  ggplot(aes(x=metric,y=gini,color=City,group=City)) +
+  geom_point(alpha=0.8) +
+  geom_line(size=1,alpha=0.8) +
+  facet_wrap(~dimension,scales = "free") +
+  scale_color_viridis_d(option="A",begin=0.3,end=0.7) +
+  ylim(0,1) +
+  xlab("Threshold") +
+  ylab("Gini") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+  
+ggsave("Cities/sp_nyc_lon_gini_cum.jpeg",dpi=600,height = 5,width=7.5)
+
+```
+
+# Maps
+```{r functions}
+#### Maps ####
+theme_map <- function(...){
+  theme(
+      axis.line = element_blank(),
+      axis.text.x = element_blank(),
+      axis.text.y = element_blank(),
+      axis.ticks = element_blank(),
+      axis.title.x = element_blank(),
+      axis.title.y = element_blank(),
+      panel.background = element_rect(fill = "white", color = NA),
+      plot.title = element_blank(),
+      plot.subtitle = element_blank(),
+      legend.title = element_text(size = 12, color = "#4e4d47"),
+      legend.text = element_text(size = 10, hjust = 0, color = "#4e4d47",family="A"),
+      legend.background = element_rect(fill = alpha('white', 0.0)),
+      ...)}
+```
+
+```{r maps_access_sp}
+
+# Map for numeric variables
+PlotMap <- function() {
+  
+  # Plot map
+ggplot() +
+    geom_sf(data = back, fill = "#f0f0f0", size = 0.3, color = "white") +
+    geom_sf(data = base, aes(fill = breaks),color=NA)  +
+    theme_map() +
+    theme(legend.position = pos_leg) +
+    scale_fill_manual(
+      #values = rev(magma(10)[3:9]),
+      values = rev(magma(10)),
+      breaks = rev(breaks_scale),
+      name = name_variable,
+      drop = FALSE,
+      labels = rev(labels),
+      guide = guide_legend(
+        direction = "horizontal",
+        keyheight = unit(3, units = "mm"),
+        keywidth = unit(9, units = "mm"),
+        title.position = 'top',
+        title.hjust = 0.5,
+        label.hjust = 1,
+        nrow = 1,
+        byrow = T,
+        reverse = T,
+        label.position = "bottom")) +
+    geom_sf(data = mask, mapping = aes(),fill = "white",color=NA) +
+    geom_sf(data = transport, mapping = aes(), color = "#606060", size = 0.6) +
+    #geom_sf(data = buffer, mapping=aes(), fill = "transparent", size = 0.4, color = "white",linetype = "dashed") +
+    geom_sf(data = mun, mapping=aes(), fill = "transparent", size = 0.2, color = "white") +
+    coord_sf(xlim=c(-46.85,-46.34),ylim=c(-23.9,-23.4)) +
+    ggsn::scalebar(data = base, dist = 10, st.color = "#4e4d47", st.size=3, box.fill = c("#4e4d47","#f0f0f0"), box.color = "#4e4d47", border.size = 0.2, height=0.015, dist_unit = "km", location = "bottomright", model = 'WGS84',transform = TRUE,anchor = c(x=-46.34, y=-23.9)) +
+    ggsn::north(data = base, location = "topright", scale = 0.1, symbol = 12)
+}
+
+back <- st_read("Cities/Sao Paulo/Mapas/Municipios_2017_region.shp") %>%
+  st_transform(4326)
+mun <- back %>% filter(NumeroMuni == 36)
+transport <-  st_read("Cities/Sao Paulo/sp_transport_axes.shp")
+mask <- st_read("Cities/Sao Paulo/sp_mask.shp")
+
+
+breaks <- c(0,0.01,0.05,0.1,0.15,0.2,0.3,1)
+labels <- c("0.01","0.05","0.1","0.15","0.2",'0.3',"++") 
+
+base <- st_read("Cities/Sao Paulo/sp_access_cum.shp")
+pos_leg <- c(0.69,0.15)
+
+variable <- base$time30
+name_variable <- "30-minutes accessibility"
+threshold <- "time30"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/Sao Paulo/Plots/sp_ac_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$time45
+name_variable <- "45-minutes accessibility"
+threshold <- "time45"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/Sao Paulo/Plots/sp_ac_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$time60
+name_variable <- "60-minutes accessibility"
+threshold <- "time60"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/Sao Paulo/Plots/sp_ac_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$time90
+name_variable <- "90-minutes accessibility"
+threshold <- "time90"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/Sao Paulo/Plots/sp_ac_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$time120
+name_variable <- "120-minutes accessibility"
+threshold <- "time120"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/Sao Paulo/Plots/sp_ac_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$board0
+name_variable <- "0-transfers accessibility"
+threshold <- "board0"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/Sao Paulo/Plots/sp_ac_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$board1
+name_variable <- "1-transfer accessibility"
+threshold <- "board1"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/Sao Paulo/Plots/sp_ac_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$board2
+name_variable <- "2-transfers accessibility"
+threshold <- "board2"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/Sao Paulo/Plots/sp_ac_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$board3
+name_variable <- "3-transfers accessibility"
+threshold <- "board3"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/Sao Paulo/Plots/sp_ac_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$board4
+name_variable <- "4-transfers accessibility"
+threshold <- "board4"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/Sao Paulo/Plots/sp_ac_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$cost10
+name_variable <- "10%-cost accessibility"
+threshold <- "cost10"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/Sao Paulo/Plots/sp_ac_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$cost20
+name_variable <- "20%-cost accessibility"
+threshold <- "cost20"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/Sao Paulo/Plots/sp_ac_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$cost30
+name_variable <- "30%-cost accessibility"
+threshold <- "cost30"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/Sao Paulo/Plots/sp_ac_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$cost40
+name_variable <- "40%-cost accessibility"
+threshold <- "cost40"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/Sao Paulo/Plots/sp_ac_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$cost5
+name_variable <- "5%-cost accessibility"
+threshold <- "cost5"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/Sao Paulo/Plots/sp_ac_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+#### Simulations
+
+base <- st_read("Cities/Sao Paulo/sp_access_sim_cum.shp")
+pos_leg <- c(0.69,0.15)
+
+# 45-minutes accessibility + 10% cost + 2 transfers
+variable <- base$time60_20
+name_variable <- "60-minutes 20%-income 2-transfers"
+threshold <- "time60_20"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/Sao Paulo/Plots/sp_ac_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+### Urban occupation
+
+base <- st_read("Cities/Sao Paulo/sp_access_cum.shp") %>% mutate(workers = hi_wh+hi_bl+hi_ot+md_wh+md_bl+md_ot+lo_wh+lo_bl+lo_ot)
+breaks <- c(0,0.05,0.1,0.2,0.3,0.4,0.5,1)
+labels <- c("5%","10%","20%","30%",'40%',"50%","85%") 
+
+variable <- base$hi_wh/base$workers
+name_variable <- "Upper-class white"
+threshold <- "hi_wh"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/Sao Paulo/Plots/sp_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$hi_bl/base$workers
+name_variable <- "Upper-class black"
+threshold <- "hi_bl"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/Sao Paulo/Plots/sp_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$hi_ot/base$workers
+name_variable <- "Upper-class non-white"
+threshold <- "hi_ot"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/Sao Paulo/Plots/sp_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$md_wh/base$workers
+name_variable <- "Middle-class white"
+threshold <- "md_wh"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/Sao Paulo/Plots/sp_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$md_bl/base$workers
+name_variable <- "Middle-class black"
+threshold <- "md_bl"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/Sao Paulo/Plots/sp_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$md_ot/base$workers
+name_variable <- "Middle-class non-white"
+threshold <- "md_ot"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/Sao Paulo/Plots/sp_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$lo_wh/base$workers
+name_variable <- "Lower-class white"
+threshold <- "lo_wh"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/Sao Paulo/Plots/sp_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$lo_bl/base$workers
+name_variable <- "Lower-class black"
+threshold <- "lo_bl"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/Sao Paulo/Plots/sp_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$lo_ot/base$workers
+name_variable <- "Lower-class non-white"
+threshold <- "lo_ot"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/Sao Paulo/Plots/sp_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+#Income 
+pos_leg <- c(0.5,0.15)
+breaks <- base %>%
+  st_drop_geometry() %>%
+  filter(income>0) %>%
+  mutate(income = income*12/1000) %>%
+  mutate(qtd = round(percent_rank(income)*100,-1)) %>%
+  group_by(qtd) %>%
+  summarise(maxinc = max(income,na.rm=T))%>%
+  filter(qtd != 10) %>%
+  select(maxinc) %>%
+  unlist() %>%
+  round(0) 
+labels <- breaks
+breaks <- c(0,breaks)
+variable <- base$income*12/1000
+name_variable <- "Income (R$)"
+threshold <- "income"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = labels)
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+labels <- paste0(labels,"k")
+PlotMap()
+ggsave(paste0("Cities/Sao Paulo/Plots/sp_dec_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+```
+
+```{r maps_access_nyc}
+
+PlotMap <- function() {
+  
+  # Plot map
+ggplot() +
+    geom_sf(data = back, fill = "#f0f0f0", size = 0.3, color = "white") +
+    geom_sf(data = base, aes(fill = breaks),color=NA)  +
+    theme_map() +
+    theme(legend.position = pos_leg) +
+   scale_fill_manual(
+      #values = rev(magma(10)[3:9]),
+      values = rev(magma(10)),
+      breaks = rev(breaks_scale),
+      name = name_variable,
+      drop = FALSE,
+      labels = rev(labels),
+      guide = guide_legend(
+        direction = "horizontal",
+        keyheight = unit(3, units = "mm"),
+        keywidth = unit(9, units = "mm"),
+        title.position = 'top',
+        title.hjust = 0.5,
+        label.hjust = 1,
+        nrow = 1,
+        byrow = T,
+        reverse = T,
+        label.position = "bottom")) +
+    geom_sf(data = mask, mapping = aes(),fill = "white",color=NA) +
+    geom_sf(data = transport, mapping = aes(), color = "#606060", size = 0.6) +
+    #geom_sf(data = buffer, mapping=aes(), fill = "transparent", size = 0.4, color = "white",linetype = "dashed") +
+    geom_sf(data = mun, mapping=aes(), fill = "transparent", size = 0.2, color = "white") +
+    coord_sf(xlim=c(-74.26,-73.69),ylim=c(40.48,40.93)) +
+    ggsn::scalebar(data = mun, dist = 10, st.color = "#4e4d47", st.size=3, box.fill = c("#4e4d47","#f0f0f0"), box.color = "#4e4d47", border.size = 0.2, height=0.015, dist_unit = "km", location = "bottomright", model = 'WGS84',transform = TRUE,anchor = c(x=-73.69, y=40.48)) +
+    ggsn::north(data = mun, location = "topright", scale = 0.1, symbol = 12)
+}
+
+back <- st_read("Cities/NYC/Cities_Towns.shp") %>% st_transform(4326)
+mun <- back %>% filter(COUNTY == "New York, Bronx, Kings, Richmond, Queens") %>% st_transform(4326)
+transport <-  st_read("Cities/NYC/nyc_transport_axes.shp")
+mask <- st_read("Cities/NYC/nyc_mask.shp")
+
+breaks <- c(0,0.01,0.05,0.1,0.15,0.2,0.3,1)
+labels <- c("0.01","0.05","0.1","0.15","0.2",'0.3',"++") 
+
+base <- st_read("Cities/NYC/nyc_access_cum.shp")
+pos_leg = c(0.70,0.15)
+
+variable <- base$time30
+name_variable <- "30-minutes accessibility"
+threshold <- "time30"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/NYC/Plots/nyc_ac_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$time45
+name_variable <- "45-minutes accessibility"
+threshold <- "time45"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/NYC/Plots/nyc_ac_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$time60
+name_variable <- "60-minutes accessibility"
+threshold <- "time60"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/NYC/Plots/nyc_ac_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$time90
+name_variable <- "90-minutes accessibility"
+threshold <- "time90"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/NYC/Plots/nyc_ac_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$time120
+name_variable <- "120-minutes accessibility"
+threshold <- "time120"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/NYC/Plots/nyc_ac_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$board0
+name_variable <- "0-transfers accessibility"
+threshold <- "board0"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/NYC/Plots/nyc_ac_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$board1
+name_variable <- "1-transfer accessibility"
+threshold <- "board1"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/NYC/Plots/nyc_ac_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$board2
+name_variable <- "2-transfers accessibility"
+threshold <- "board2"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/NYC/Plots/nyc_ac_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$board3
+name_variable <- "3-transfers accessibility"
+threshold <- "board3"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/NYC/Plots/nyc_ac_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$board4
+name_variable <- "4-transfers accessibility"
+threshold <- "board4"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/NYC/Plots/nyc_ac_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$cost10
+name_variable <- "10%-cost accessibility"
+threshold <- "cost10"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/NYC/Plots/nyc_ac_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$cost20
+name_variable <- "20%-cost accessibility"
+threshold <- "cost20"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/NYC/Plots/nyc_ac_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$cost30
+name_variable <- "30%-cost accessibility"
+threshold <- "cost30"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/NYC/Plots/nyc_ac_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$cost40
+name_variable <- "40%-cost accessibility"
+threshold <- "cost40"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/NYC/Plots/nyc_ac_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$cost5
+name_variable <- "5%-cost accessibility"
+threshold <- "cost5"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/NYC/Plots/nyc_ac_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+#### Simulations
+
+base <- st_read("Cities/NYC/nyc_access_sim_cum.shp")
+pos_leg = c(0.70,0.15)
+
+# 45-minutes accessibility + 10% cost + 2 transfers
+variable <- base$time60_20
+name_variable <- "60-minute 20%-income 2-transfers"
+threshold <- "time60_20"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/NYC/Plots/nyc_ac_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+### Urban occupation
+
+base <- st_read("Cities/NYC/nyc_access_cum.shp") %>% mutate(workers = hi_wh+hi_bl+hi_ot+md_wh+md_bl+md_ot+lo_wh+lo_bl+lo_ot)
+breaks <- c(0,0.05,0.1,0.2,0.3,0.4,0.5,1)
+labels <- c("5%","10%","20%","30%",'40%',"50%","85%") 
+
+variable <- base$hi_wh/base$workers
+name_variable <- "Upper-class white"
+threshold <- "hi_wh"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/NYC/Plots/nyc_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$hi_bl/base$workers
+name_variable <- "Upper-class black"
+threshold <- "hi_bl"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/NYC/Plots/nyc_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$hi_ot/base$workers
+name_variable <- "Upper-class non-white"
+threshold <- "hi_ot"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/NYC/Plots/nyc_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$md_wh/base$workers
+name_variable <- "Middle-class white"
+threshold <- "md_wh"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/NYC/Plots/nyc_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$md_bl/base$workers
+name_variable <- "Middle-class black"
+threshold <- "md_bl"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/NYC/Plots/nyc_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$md_ot/base$workers
+name_variable <- "Middle-class non-white"
+threshold <- "md_ot"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/NYC/Plots/nyc_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$lo_wh/base$workers
+name_variable <- "Lower-class white"
+threshold <- "lo_wh"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/NYC/Plots/nyc_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$lo_bl/base$workers
+name_variable <- "Lower-class black"
+threshold <- "lo_bl"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/NYC/Plots/nyc_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$lo_ot/base$workers
+name_variable <- "Lower-class non-white"
+threshold <- "lo_ot"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/NYC/Plots/nyc_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+#Income
+pos_leg <- c(0.5,0.15)
+breaks <- base %>%
+  st_drop_geometry() %>%
+  filter(income>0) %>%
+  mutate(income = income/1000) %>%
+  mutate(qtd = round(percent_rank(income)*100,-1)) %>%
+  group_by(qtd) %>%
+  summarise(maxinc = max(income,na.rm=T))%>%
+  filter(qtd != 10) %>%
+  select(maxinc) %>%
+  unlist() %>%
+  round(0) 
+labels <- breaks
+breaks <- c(0,breaks)
+variable <- base$income/1000
+name_variable <- "Income ($)"
+threshold <- "income"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = labels)
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+labels <- paste0(labels,"k")
+PlotMap()
+ggsave(paste0("Cities/NYC/Plots/nyc_dec_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+```
+
+```{r maps_access_lon}
+
+PlotMap <- function() {
+  
+  # Plot map
+ggplot() +
+    geom_sf(data = back, fill = "#f0f0f0", size = 0.3, color = "white") +
+    geom_sf(data = base, aes(fill = breaks),color=NA)  +
+    theme_map() +
+    theme(legend.position = pos_leg) +
+   scale_fill_manual(
+      #values = rev(magma(10)[3:9]),
+      values = rev(magma(10)),
+      breaks = rev(breaks_scale),
+      name = name_variable,
+      drop = FALSE,
+      labels = rev(labels),
+      guide = guide_legend(
+        direction = "horizontal",
+        keyheight = unit(3, units = "mm"),
+        keywidth = unit(9, units = "mm"),
+        title.position = 'top',
+        title.hjust = 0.5,
+        label.hjust = 1,
+        nrow = 1,
+        byrow = T,
+        reverse = T,
+        label.position = "bottom")) +
+    geom_sf(data = mask, mapping = aes(),fill = "white",color=NA) +
+    geom_sf(data = transport, mapping = aes(), color = "#606060", size = 0.6) +
+    #geom_sf(data = buffer, mapping=aes(), fill = "transparent", size = 0.4, color = "white",linetype = "dashed") +
+    geom_sf(data = mun, mapping=aes(), fill = "transparent", size = 0.2, color = "white") +
+    coord_sf(xlim=c(-0.48,0.28),ylim=c(51.25,51.68)) +
+    ggsn::scalebar(data = mun, dist = 10, st.color = "#4e4d47", st.size=3, box.fill = c("#4e4d47","#f0f0f0"), box.color = "#4e4d47", border.size = 0.2, height=0.015, dist_unit = "km", location = "bottomright", model = 'WGS84',transform = TRUE,anchor = c(x=0.28, y=51.25)) +
+    ggsn::north(data = mun, location = "topright", scale = 0.1, symbol = 12)
+}
+
+back <- st_read("Cities/London/statistical-gis-boundaries-london/Counties_and_Unitary_Authorities__December_2017__Boundaries_in_the_UK__WGS84_.shp") %>% st_transform(4326)
+mun <- st_read("Cities/London/GLA_Area.shp") %>% st_transform(4326)
+transport <-  st_read("Cities/London/lon_transport_axes.shp")
+mask <- st_read("Cities/London/lon_mask.shp")
+
+breaks <- c(0,0.01,0.05,0.1,0.15,0.2,0.3,1)
+labels <- c("0.01","0.05","0.1","0.15","0.2",'0.3',"++") 
+pos_leg <- c(0.72,0.14)
+
+base <- st_read("Cities/London/lon_access_cum.shp") %>% st_transform(4326)
+
+variable <- base$time30
+name_variable <- "30-minutes accessibility"
+threshold <- "time30"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/London/Plots/lon_ac_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$time45
+name_variable <- "45-minutes accessibility"
+threshold <- "time45"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/London/Plots/lon_ac_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$time60
+name_variable <- "60-minutes accessibility"
+threshold <- "time60"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/London/Plots/lon_ac_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$time90
+name_variable <- "90-minutes accessibility"
+threshold <- "time90"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/London/Plots/lon_ac_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$time120
+name_variable <- "120-minutes accessibility"
+threshold <- "time120"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/London/Plots/lon_ac_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$board0
+name_variable <- "0-transfers accessibility"
+threshold <- "board0"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/London/Plots/lon_ac_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$board1
+name_variable <- "1-transfer accessibility"
+threshold <- "board1"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/London/Plots/lon_ac_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$board2
+name_variable <- "2-transfers accessibility"
+threshold <- "board2"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/London/Plots/lon_ac_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$board3
+name_variable <- "3-transfers accessibility"
+threshold <- "board3"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/London/Plots/lon_ac_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$board4
+name_variable <- "4-transfers accessibility"
+threshold <- "board4"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/London/Plots/lon_ac_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$cost10
+name_variable <- "10%-cost accessibility"
+threshold <- "cost10"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/London/Plots/lon_ac_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$cost20
+name_variable <- "20%-cost accessibility"
+threshold <- "cost20"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/London/Plots/lon_ac_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$cost30
+name_variable <- "30%-cost accessibility"
+threshold <- "cost30"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/London/Plots/lon_ac_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$cost40
+name_variable <- "40%-cost accessibility"
+threshold <- "cost40"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/London/Plots/lon_ac_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$cost5
+name_variable <- "5%-cost accessibility"
+threshold <- "cost5"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/London/Plots/lon_ac_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$cost25
+name_variable <- "2.5%-cost accessibility"
+threshold <- "cost25"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/London/Plots/lon_ac_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+#### Simulations
+
+base <- st_read("Cities/London/lon_access_sim_cum.shp") 
+pos_leg <- c(0.72,0.14)
+
+# 45-minutes accessibility + 10% cost + 2 transfers
+variable <- base$time60_20
+name_variable <- "60-minutes 10%-income 2-transfers"
+threshold <- "time60_20"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/London/Plots/lon_ac_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+### Urban occupation
+
+base <- st_read("Cities/London/lon_access_cum.shp") %>% mutate(workers = hi_wh+hi_bl+hi_ot+md_wh+md_bl+md_ot+lo_wh+lo_bl+lo_ot)
+breaks <- c(0,0.05,0.1,0.2,0.3,0.4,0.5,1)
+labels <- c("5%","10%","20%","30%",'40%',"50%","85%") 
+
+variable <- base$hi_wh/base$workers
+name_variable <- "Upper-class white"
+threshold <- "hi_wh"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/London/Plots/lon_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$hi_bl/base$workers
+name_variable <- "Upper-class black"
+threshold <- "hi_bl"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/London/Plots/lon_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$hi_ot/base$workers
+name_variable <- "Upper-class non-white"
+threshold <- "hi_ot"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/London/Plots/lon_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$md_wh/base$workers
+name_variable <- "Middle-class white"
+threshold <- "md_wh"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/London/Plots/lon_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$md_bl/base$workers
+name_variable <- "Middle-class black"
+threshold <- "md_bl"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/London/Plots/lon_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$md_ot/base$workers
+name_variable <- "Middle-class non-white"
+threshold <- "md_ot"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/London/Plots/lon_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$lo_wh/base$workers
+name_variable <- "Lower-class white"
+threshold <- "lo_wh"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/London/Plots/lon_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$lo_bl/base$workers
+name_variable <- "Lower-class black"
+threshold <- "lo_bl"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/London/Plots/lon_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+variable <- base$lo_ot/base$workers
+name_variable <- "Lower-class non-white"
+threshold <- "lo_ot"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = breaks[2:8])
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+PlotMap()
+ggsave(paste0("Cities/London/Plots/lon_",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+#Income
+pos_leg <- c(0.5,0.15)
+breaks <- base %>%
+  st_drop_geometry() %>%
+  filter(income>0) %>%
+  mutate(income = income/1000) %>%
+  mutate(qtd = round(percent_rank(income)*100,-1)) %>%
+  group_by(qtd) %>%
+  summarise(maxinc = max(income,na.rm=T))%>%
+  filter(qtd != 10) %>%
+  select(maxinc) %>%
+  unlist() %>%
+  round(0) 
+labels <- breaks
+breaks <- c(0,breaks)
+variable <- base$income/1000
+name_variable <- "Income (£)"
+threshold <- "income"
+base$breaks <- cut(variable,breaks = breaks,include.lowest = TRUE,labels = labels)
+breaks_scale <- levels(base$breaks) %>% as.numeric()  
+labels <- paste0(labels,"k")
+PlotMap()
+ggsave(paste0("Cities/London/Plots/lon_dec",threshold,".jpeg"),dpi=600,height = 5,width=7.5)
+
+```
+
+# Robustness check
+```{r sp}
+
+hx <- st_read("Cities/Sao Paulo/sp_hex1000_data_MR.shp") %>%
+  filter(pop >= 0) %>%
+  mutate(GEO_ID = as.character(GEO_ID)) %>%
+  filter(CD_GEOCODM == "3550308")
+
+# Jobs
+jobs <- read.dbf("Cities/Sao Paulo/Banco de Dados/OD_2017.dbf") %>% 
+  filter(F_PESS == 1) %>%
+  filter(TRAB1_RE == 2) %>%
+  select(FE_PESS,CO_TR1_X,CO_TR1_Y) %>%
+  rename("X" = CO_TR1_X, "Y" = CO_TR1_Y) %>%
+  rbind(read.dbf("Cities/Sao Paulo/Banco de Dados/OD_2017.dbf") %>% 
+          filter(F_PESS == 1) %>%
+          filter(MUNI_DOM == 36) %>%
+          filter(TRAB2_RE == 2) %>%
+          select(FE_PESS,CO_TR2_X,CO_TR2_Y) %>%
+          rename("X" = CO_TR2_X, "Y" = CO_TR2_Y)) %>%
+  na.omit() %>%
+  st_as_sf(coords=c("X","Y"),remove=F,crs=22523) %>%
+  st_transform(4326) %>%
+  st_join(hx,join=st_within) %>%
+  st_drop_geometry() %>%
+  group_by(GEO_ID) %>%
+  summarise(jobs = sum(FE_PESS,na.rm=T))
+
+# Income
+socio <- read.csv("Cities/Sao Paulo/Basico_SP.csv",sep=";") %>%
+  rename("population" = V002,"income" = V009,"CD_GEOCODI"="Cod_setor") %>%
+  mutate(CD_GEOCODI = as.character(CD_GEOCODI))
+socio <- st_read("Cities/Sao Paulo/sp_ct_hex.shp")  %>%
+  mutate(CD_GEOCODI = as.character(CD_GEOCODI)) %>%
+  select(CD_GEOCODI,GEO_ID) %>%
+  mutate(area_polygon = as.numeric(st_area(.))) %>%
+  st_drop_geometry() %>%
+  select(CD_GEOCODI,GEO_ID,area_polygon) %>%
+  group_by(CD_GEOCODI) %>%
+  mutate(area_ct = sum(area_polygon,na.rm = T)) %>%
+  ungroup() %>%
+  left_join(socio,by="CD_GEOCODI") %>%
+  mutate(pop1 = population*area_polygon/area_ct) %>%
+  group_by(GEO_ID) %>%
+  summarize(pop = sum(pop1,na.rm = T),
+            income = sum(income*pop1,na.rm=T)/sum(pop1,na.rm=T)) %>%
+  ungroup() %>%
+  mutate(GEO_ID = as.character(GEO_ID)) 
+
+# Join travel time matrix with jobs database by destination
+hex <- read.csv("OTP/SP_bus-rail/sp_traveltime_matrix_745.csv") %>%
+  mutate(GEO_ID_i = as.character(origin), GEO_ID_j = as.character(destination)) %>%
+  inner_join(st_read("Cities/Sao Paulo/sp_hex1000_data_MR.shp") %>%
+  filter(CD_GEOCODM == "3550308") %>%
+              st_drop_geometry() %>%
+              mutate(GEO_ID_i = GEO_ID) %>%
+               mutate(GEO_ID_i = as.character(GEO_ID_i)) %>%
+              select(GEO_ID_i), by="GEO_ID_i") %>%
+  inner_join(jobs %>%
+              mutate(GEO_ID_j = GEO_ID) %>%
+              select(GEO_ID_j,jobs), by="GEO_ID_j") %>%
+  inner_join(socio %>%
+              mutate(GEO_ID_i = GEO_ID) %>%
+              select(GEO_ID_i,pop,income), by="GEO_ID_i")  %>%
+  mutate(time = travel_time/60,income=income/30) %>%
+  mutate(transfers = boardings)
+
+# Summary
+n_jobs <- hex %>% group_by(GEO_ID_j) %>% summarise(jobs = mean(jobs, na.rm = T)) %>% ungroup()
+n_jobs <- sum(n_jobs$jobs,na.rm=T)
+
+#n_pop <- 9354000 #PEA
+n_pop <- read.dbf("Cities/Sao Paulo/Banco de Dados/OD_2017.dbf") %>% 
+  filter(MUNI_DOM == 36) %>%
+  filter(F_PESS == 1) %>%
+  filter(IDADE >= 18) %>%
+  filter(IDADE <= 64)
+n_pop <- sum(n_pop$FE_PESS,na.rm=T)
+n_jobs/n_pop
+
+# Accessibility
+hex_ac <- hex %>%
+  mutate(time30 = ifelse(time <= 30,jobs,0),
+         time45 = ifelse(time <= 45,jobs,0),
+         time60 = ifelse(time <= 60,jobs,0),
+         time90 = ifelse(time <= 90,jobs,0)) %>%
+  mutate_at(c("time30","time45","time60","time90"),~(p = ./n_pop)) %>%
+  group_by(GEO_ID_i) %>%
+  summarise(time30 = sum(time30,na.rm=T),
+            time45 = sum(time45,na.rm = T),
+            time60 = sum(time60,na.rm=T),
+            time90 = sum(time90,na.rm=T))
+
+# Join with socioeconomic data
+access_shp <- st_read("Cities/Sao Paulo/sp_hex1000_data_MR.shp") %>%
+  select(GEO_ID,CD_GEOCODM) %>%
+  mutate(GEO_ID = as.character(GEO_ID)) %>%
+  mutate(GEO_ID_i=GEO_ID) %>%
+  inner_join(hex_ac, by = "GEO_ID_i") %>%
+  inner_join(jobs,by=c("GEO_ID_i"="GEO_ID")) %>%
+  inner_join(socio,by=c("GEO_ID_i"="GEO_ID")) %>%
+  select(-GEO_ID_i) %>%
+  filter(CD_GEOCODM == "3550308")
+
+st_write(access_shp,"Cities/Sao Paulo/sp_access_cum745.shp", delete_layer = TRUE)
+
+```
+
+```{r nyc}
+
+hx <- st_read("Cities/NYC/nyc_hex1000_MR.shp") %>%
+  mutate(GEO_ID = as.character(GEO_ID))
+# Data
+trips <- read_delim("Cities/NYC/ltrips_short_exp123_wkdy_final_noXYcoord.txt",delim=",")
+person <- read_delim("Cities/NYC/per_analysis_final_noXYcoord.txt",delim=",") 
+household <- read_delim("Cities/NYC/hh_analysis_final_noXYcoord.txt",delim=",")
+
+# Zones belonging to each census tract
+inc <- st_read("Cities/NYC/nyc_censustracts.shp") %>% st_drop_geometry() %>%
+  mutate(ct2010 = paste0(STATE,COUNTY,ct2010)) %>%
+  select(ct2010) %>%
+  left_join(read_csv("Cities/NYC/income2018mod.csv",na = "N") %>%
+  mutate(ct2010 = substr(ct,10,30)),by="ct2010") %>%
+  select(-ct) %>%
+  mutate_all(as.numeric) %>%
+  mutate(ct2010 = as.character(ct2010))
+
+
+# Jobs
+jobs <- trips %>% 
+  filter(D_PURP %in% c("12","13")) %>%
+  group_by(D_TRACT) %>%
+  summarise(jobs = sum(EXP1_FINAL_WKD,na.rm=T)) %>%
+  mutate(D_TRACT = as.character(D_TRACT))
+jobs <- st_read("Cities/NYC/nyc_ct_hex.shp") %>%
+  mutate(area_polygon = as.numeric(st_area(.))) %>%
+  st_drop_geometry() %>%
+  mutate(ct2010 = paste0(STATE,COUNTY,ct2010)) %>%
+  group_by(ct2010) %>%
+  mutate(area_ct  = sum(area_polygon,na.rm = T)) %>%
+  ungroup() %>%
+  left_join(jobs,by=c("ct2010"="D_TRACT")) %>%
+  mutate(jobs = jobs*area_polygon/area_ct) %>%
+  group_by(GEO_ID) %>%
+  summarise(jobs = sum(jobs,na.rm = T)) %>%
+  mutate(GEO_ID = as.character(GEO_ID)) 
+
+# Income
+socio <- st_read("Cities/NYC/nyc_censustracts.shp") %>% st_drop_geometry() %>%
+  mutate(ct2010 = paste0(STATE,COUNTY,ct2010)) %>%
+  select(ct2010) %>%
+  left_join(read_csv("Cities/NYC/income2018mod.csv",na = "N") %>%
+  mutate(ct2010 = substr(ct,10,30)),by="ct2010") %>%
+  select(-ct) %>%
+  mutate_all(as.numeric) %>%
+  mutate(ct2010 = as.character(ct2010))
+socio <- st_read("Cities/NYC/nyc_ct_hex.shp") %>%
+  mutate(area_polygon = as.numeric(st_area(.))) %>%
+  st_drop_geometry() %>%
+  mutate(ct2010 = paste0(STATE,COUNTY,ct2010)) %>%
+  group_by(ct2010) %>%
+  mutate(area_ct  = sum(area_polygon,na.rm = T)) %>%
+  ungroup() %>%
+  left_join(socio,by="ct2010") %>%
+  mutate(pop1 = num_hh*area_polygon/area_ct) %>%
+  group_by(GEO_ID) %>%
+  summarize(pop = sum(pop1,na.rm = T),
+            income = sum(pc_inc*pop1,na.rm=T)/sum(pop1,na.rm=T)) %>%
+  ungroup() %>%
+  mutate(GEO_ID = as.character(GEO_ID)) 
+
+# Join travel time matrix with jobs database by destination
+hex <- read.csv("OTP/NYC/nyc_traveltime_matrix_800.csv") %>%
+  mutate(GEO_ID_i = as.character(origin), GEO_ID_j = as.character(destination)) %>%
+  inner_join(st_read("Cities/NYC/nyc_hex1000_MR.shp") %>%
+              st_drop_geometry() %>%
+              mutate(GEO_ID_i = GEO_ID) %>%
+               mutate(GEO_ID_i = as.character(GEO_ID_i)) %>%
+              select(GEO_ID_i), by="GEO_ID_i") %>%
+  inner_join(jobs %>%
+              mutate(GEO_ID_j = GEO_ID) %>%
+              select(GEO_ID_j,jobs), by="GEO_ID_j") %>%
+  inner_join(socio %>%
+              mutate(GEO_ID_i = GEO_ID) %>%
+              select(GEO_ID_i,pop,income), by="GEO_ID_i")  %>%
+  mutate(time = travel_time/60,income=income/30) %>%
+  mutate(transfers = boardings)
+
+# Summary
+n_jobs <- hex %>% group_by(GEO_ID_j) %>% summarise(jobs = mean(jobs, na.rm = T)) %>% ungroup()
+n_jobs <- sum(n_jobs$jobs,na.rm=T)
+
+n_pop <- 6234317 #PEA
+
+# Accessibility
+hex_ac <- hex %>%
+  mutate(time30 = ifelse(time <= 30,jobs,0),
+         time45 = ifelse(time <= 45,jobs,0),
+         time60 = ifelse(time <= 60,jobs,0),
+         time90 = ifelse(time <= 90,jobs,0)) %>%
+  mutate_at(c("time30","time45","time60","time90"),~(p = ./n_pop)) %>%
+  group_by(GEO_ID_i) %>%
+  summarise(time30 = sum(time30,na.rm=T),
+            time45 = sum(time45,na.rm = T),
+            time60 = sum(time60,na.rm=T),
+            time90 = sum(time90,na.rm=T))
+
+# Join with socioeconomic data
+access_shp <- st_read("Cities/NYC/nyc_hex1000_MR.shp") %>%
+  mutate(GEO_ID = as.character(GEO_ID)) %>%
+  mutate(GEO_ID_i=GEO_ID) %>%
+  inner_join(hex_ac, by = "GEO_ID_i") %>%
+  inner_join(jobs,by=c("GEO_ID_i"="GEO_ID")) %>%
+  inner_join(socio,by=c("GEO_ID_i"="GEO_ID")) %>%
+  select(-GEO_ID_i)
+
+st_write(access_shp,"Cities/NYC/nyc_access_cum800.shp", delete_layer = TRUE)
+
+
+```
+
+```{r lon}
+hx <- st_read("Cities/London/lon_hex1000_MR.shp") %>%
+  mutate(GEO_ID = as.character(GEO_ID))
+
+# Jobs
+jobs <- read.csv("Cities/London/LD_Jobs_Tot.csv",sep=";") %>%
+  select(code,workplaceP)
+jobs <- st_read("Cities/London/lon_MSOA_hex.shp") %>%
+  mutate(area_polygon = as.numeric(st_area(.))) %>%
+  st_drop_geometry() %>%
+  mutate(code=CODE) %>%
+  select(code,GEO_ID,area_polygon) %>%
+  group_by(code) %>%
+  mutate(area_ct  = sum(area_polygon,na.rm = T)) %>%
+  ungroup() %>%
+  left_join(jobs,by="code") %>%
+  mutate(jobs = workplaceP*area_polygon/area_ct) %>%
+  group_by(GEO_ID) %>%
+  summarise(jobs = sum(jobs,na.rm = T)) %>%
+  mutate(GEO_ID = as.character(GEO_ID)) 
+
+
+# Income
+socio <- read.csv("Cities/London/modelled-household-income-estimates-lsoa.csv",sep=";") %>%
+  left_join(read.csv("Cities/London/Data_UNIT_URESPOP.csv",sep=";"),by=c("Code"="GEO_CODE")) %>%
+  mutate(income=(Mean.2012.13*Households)/Population.in.Households) %>%
+  select(Code,income,Population)
+socio <- st_read("Cities/London/lon_LSOA_hex.shp") %>%
+  select(LSOA11CD,GEO_ID) %>%
+  rename("Code" = LSOA11CD) %>%
+  mutate(area_polygon = as.numeric(st_area(.))) %>%
+  st_drop_geometry() %>%
+  select(Code,GEO_ID,area_polygon) %>%
+  group_by(Code) %>%
+  mutate(area_ct  = sum(area_polygon,na.rm = T)) %>%
+  ungroup() %>%
+  left_join(socio,by="Code") %>%
+  mutate(pop1 = Population*area_polygon/area_ct) %>%
+  group_by(GEO_ID) %>%
+  summarize(pop = sum(pop1,na.rm = T),
+            income = sum(income*pop1,na.rm=T)/sum(pop1,na.rm=T)) %>%
+  ungroup() %>%
+  mutate(GEO_ID = as.character(GEO_ID)) 
+
+
+# Join travel time matrix with jobs database by destination
+hex <- read.csv("OTP/LON/lon_traveltime_matrix_800.csv") %>%
+  mutate(GEO_ID_i = as.character(origin), GEO_ID_j = as.character(destination)) %>%
+  inner_join(st_read("Cities/London/lon_hex1000_MR.shp")  %>%
+              st_drop_geometry() %>%
+              mutate(GEO_ID_i = GEO_ID) %>%
+               mutate(GEO_ID_i = as.character(GEO_ID_i)) %>%
+              select(GEO_ID_i), by="GEO_ID_i") %>%
+  inner_join(jobs %>%
+              mutate(GEO_ID_j = GEO_ID) %>%
+              select(GEO_ID_j,jobs), by="GEO_ID_j") %>%
+  inner_join(socio %>%
+              mutate(GEO_ID_i = GEO_ID) %>%
+              select(GEO_ID_i,pop,income), by="GEO_ID_i")  %>%
+  mutate(time = travel_time/60,income=income/30) %>%
+  mutate(transfers = boardings)
+
+# Summary
+n_jobs <- hex %>% group_by(GEO_ID_j) %>% summarise(jobs = mean(jobs, na.rm = T)) %>% ungroup()
+n_jobs <- sum(n_jobs$jobs,na.rm=T)
+
+n_pop <- 6388233 #PEA
+
+# Accessibility
+hex_ac <- hex %>%
+  mutate(time30 = ifelse(time <= 30,jobs,0),
+         time45 = ifelse(time <= 45,jobs,0),
+         time60 = ifelse(time <= 60,jobs,0),
+         time90 = ifelse(time <= 90,jobs,0)) %>%
+  mutate_at(c("time30","time45","time60","time90"),~(p = ./n_pop)) %>%
+  group_by(GEO_ID_i) %>%
+  summarise(time30 = sum(time30,na.rm=T),
+            time45 = sum(time45,na.rm = T),
+            time60 = sum(time60,na.rm=T),
+            time90 = sum(time90,na.rm=T))
+
+# Join with socioeconomic data
+access_shp <- st_read("Cities/London/lon_hex1000_MR.shp") %>%
+  mutate(GEO_ID = as.character(GEO_ID)) %>%
+  mutate(GEO_ID_i=GEO_ID) %>%
+  inner_join(hex_ac, by = "GEO_ID_i") %>%
+  inner_join(jobs,by=c("GEO_ID_i"="GEO_ID")) %>%
+  inner_join(socio,by=c("GEO_ID_i"="GEO_ID")) %>%
+  select(-GEO_ID_i)
+
+st_write(access_shp,"Cities/London/lon_access_cum800.shp", delete_layer = TRUE)
+
+
+```
+
+```{r graphs}
+
+# SP
+ac700 <- st_read("Cities/Sao Paulo/sp_access_cum.shp") %>% st_drop_geometry()
+ac715 <- st_read("Cities/Sao Paulo/sp_access_cum715.shp") %>% select("GEO_ID","time30","time45","time60","time90") %>% st_drop_geometry()
+ac730 <- st_read("Cities/Sao Paulo/sp_access_cum730.shp")%>% select("GEO_ID","time30","time45","time60","time90") %>% st_drop_geometry()
+ac745 <- st_read("Cities/Sao Paulo/sp_access_cum745.shp")%>% select("GEO_ID","time30","time45","time60","time90") %>% st_drop_geometry()
+ac800 <- st_read("Cities/Sao Paulo/sp_access_cum800.shp")%>% select("GEO_ID","time30","time45","time60","time90") %>% st_drop_geometry()
+
+ids <- Reduce(intersect,list(ac700$GEO_ID,ac715$GEO_ID,ac730$GEO_ID,ac800$GEO_ID))
+
+ac700 <- ac700 %>% filter(GEO_ID %in% ids) %>% arrange(GEO_ID) %>%
+  rename_at(c("time30","time45","time60","time90"),~(p=paste0(.,"_700")))
+ac715 <- ac715 %>% filter(GEO_ID %in% ids) %>% arrange(GEO_ID)%>%
+  select("GEO_ID","time30","time45","time60","time90") %>%
+  rename_at(c("time30","time45","time60","time90"),~(p=paste0(.,"_715"))) 
+ac730 <- ac730 %>% filter(GEO_ID %in% ids) %>% arrange(GEO_ID)%>%
+  select("GEO_ID","time30","time45","time60","time90")%>%
+  rename_at(c("time30","time45","time60","time90"),~(p=paste0(.,"_730")))
+ac745 <- ac745 %>% filter(GEO_ID %in% ids) %>% arrange(GEO_ID)%>%
+  select("GEO_ID","time30","time45","time60","time90")%>%
+  rename_at(c("time30","time45","time60","time90"),~(p=paste0(.,"_745")))
+ac800 <- ac800 %>% filter(GEO_ID %in% ids) %>% arrange(GEO_ID)%>%
+  select("GEO_ID","time30","time45","time60","time90")%>%
+  rename_at(c("time30","time45","time60","time90"),~(p=paste0(.,"_800")))
+
+
+ac <- ac700 %>% left_join(ac715,by="GEO_ID") %>% left_join(ac730,by="GEO_ID") %>% left_join(ac745,by="GEO_ID") %>% left_join(ac800,by="GEO_ID") %>%
+  na.omit()
+
+
+#Time
+ac %>% select(time30_700,time30_715,time30_730,time30_745,time30_800) %>% cor()
+ac %>% select(time45_700,time45_715,time45_730,time45_745,time45_800) %>% cor()
+ac %>% select(time60_700,time60_715,time60_730,time60_745,time60_800) %>% cor()
+ac %>% select(time90_700,time90_715,time90_730,time90_745,time90_800) %>% cor()
+
+means700 <- rbind(ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time30_700,.))) %>%
+                   mutate(var = "Time 30"),
+                  ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time45_700,.))) %>%
+                   mutate(var = "Time 45"),
+                 ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time60_700,.))) %>%
+                   mutate(var = "Time 60"),
+                 ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time90_700,.))) %>%
+                   mutate(var = "Time 90")) %>%
+  gather(key="group",value="ac",-c(var))
+
+means715 <- rbind(ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time30_715,.))) %>%
+                   mutate(var = "Time 30"),
+                  ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time45_715,.))) %>%
+                   mutate(var = "Time 45"),
+                 ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time60_715,.))) %>%
+                   mutate(var = "Time 60"),
+                 ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time90_715,.))) %>%
+                   mutate(var = "Time 90")) %>%
+  gather(key="group",value="ac",-c(var))
+
+means730 <- rbind(ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time30_730,.))) %>%
+                   mutate(var = "Time 30"),
+                  ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time45_730,.))) %>%
+                   mutate(var = "Time 45"),
+                 ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time60_730,.))) %>%
+                   mutate(var = "Time 60"),
+                 ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time90_730,.))) %>%
+                   mutate(var = "Time 90")) %>%
+  gather(key="group",value="ac",-c(var))
+
+means745 <- rbind(ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time30_745,.))) %>%
+                   mutate(var = "Time 30"),
+                  ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time45_745,.))) %>%
+                   mutate(var = "Time 45"),
+                 ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time60_745,.))) %>%
+                   mutate(var = "Time 60"),
+                 ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time90_745,.))) %>%
+                   mutate(var = "Time 90")) %>%
+  gather(key="group",value="ac",-c(var))
+
+means800 <- rbind(ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time30_800,.))) %>%
+                   mutate(var = "Time 30"),
+                  ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time45_800,.))) %>%
+                   mutate(var = "Time 45"),
+                 ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time60_800,.))) %>%
+                   mutate(var = "Time 60"),
+                 ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time90_800,.))) %>%
+                   mutate(var = "Time 90")) %>%
+  gather(key="group",value="ac",-c(var))
+
+means <- rbind(means700 %>% mutate(Departure="7:00"),
+               means715 %>% mutate(Departure="7:15"),
+               means730 %>% mutate(Departure="7:30"),
+               means745 %>% mutate(Departure="7:45"),
+               means800 %>% mutate(Departure="8:00"))
+
+means$group <- case_when(means$group == "hi_wh" ~ "Upper\nwhite",
+                         means$group == "hi_ot" ~ "Upper\nother",
+                         means$group == "hi_bl" ~ "Upper\nblack",
+                         means$group == "md_wh" ~ "Middle\nwhite",
+                         means$group == "md_ot" ~ "Middle\nother",
+                         means$group == "md_bl" ~ "Middle\nblack",
+                         means$group == "lo_wh" ~ "Lower\nwhite",
+                         means$group == "lo_ot" ~ "Lower\nother",
+                         means$group == "lo_bl" ~ "Lower\nblack")
+means$group <- factor(means$group,levels=c("Upper\nwhite","Upper\nother","Upper\nblack","Middle\nwhite","Middle\nother","Middle\nblack","Lower\nwhite","Lower\nother","Lower\nblack"))
+
+
+ggplot() +
+  geom_line(data=means,aes(x=group,y=ac,group=interaction(var,Departure),color=Departure),size=1,alpha=0.8)+
+  scale_color_manual(values = magma(7)[2:6]) +
+  facet_wrap(~var) +
+  theme_minimal() +
+  theme(legend.position = "bottom") +
+  ylab('Average accessibility') +
+  xlab('Group') +
+  ylim(0,0.6)
+ggsave("Cities/robstness_sp.jpeg",dpi=600,height = 6,width=8)
+
+# NYC
+ac700 <- st_read("Cities/NYC/nyc_access_cum.shp") %>% st_drop_geometry()
+ac715 <- st_read("Cities/NYC/nyc_access_cum715.shp") %>% select("GEO_ID","time30","time45","time60","time90") %>% st_drop_geometry()
+ac730 <- st_read("Cities/NYC/nyc_access_cum730.shp")%>% select("GEO_ID","time30","time45","time60","time90") %>% st_drop_geometry()
+ac745 <- st_read("Cities/NYC/nyc_access_cum745.shp")%>% select("GEO_ID","time30","time45","time60","time90") %>% st_drop_geometry()
+ac800 <- st_read("Cities/NYC/nyc_access_cum800.shp")%>% select("GEO_ID","time30","time45","time60","time90") %>% st_drop_geometry()
+
+ids <- Reduce(intersect,list(ac700$GEO_ID,ac715$GEO_ID,ac730$GEO_ID,ac800$GEO_ID))
+
+ac700 <- ac700 %>% filter(GEO_ID %in% ids) %>% arrange(GEO_ID) %>%
+  rename_at(c("time30","time45","time60","time90"),~(p=paste0(.,"_700")))
+ac715 <- ac715 %>% filter(GEO_ID %in% ids) %>% arrange(GEO_ID)%>%
+  select("GEO_ID","time30","time45","time60","time90") %>%
+  rename_at(c("time30","time45","time60","time90"),~(p=paste0(.,"_715"))) 
+ac730 <- ac730 %>% filter(GEO_ID %in% ids) %>% arrange(GEO_ID)%>%
+  select("GEO_ID","time30","time45","time60","time90")%>%
+  rename_at(c("time30","time45","time60","time90"),~(p=paste0(.,"_730")))
+ac745 <- ac745 %>% filter(GEO_ID %in% ids) %>% arrange(GEO_ID)%>%
+  select("GEO_ID","time30","time45","time60","time90")%>%
+  rename_at(c("time30","time45","time60","time90"),~(p=paste0(.,"_745")))
+ac800 <- ac800 %>% filter(GEO_ID %in% ids) %>% arrange(GEO_ID)%>%
+  select("GEO_ID","time30","time45","time60","time90")%>%
+  rename_at(c("time30","time45","time60","time90"),~(p=paste0(.,"_800")))
+
+
+ac <- ac700 %>% left_join(ac715,by="GEO_ID") %>% left_join(ac730,by="GEO_ID") %>% left_join(ac745,by="GEO_ID") %>% left_join(ac800,by="GEO_ID") %>%
+  na.omit()
+
+
+#Time
+ac %>% select(time30_700,time30_715,time30_730,time30_745,time30_800) %>% cor()
+ac %>% select(time45_700,time45_715,time45_730,time45_745,time45_800) %>% cor()
+ac %>% select(time60_700,time60_715,time60_730,time60_745,time60_800) %>% cor()
+ac %>% select(time90_700,time90_715,time90_730,time90_745,time90_800) %>% cor()
+
+
+means700 <- rbind(ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time30_700,.))) %>%
+                   mutate(var = "Time 30"),
+                  ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time45_700,.))) %>%
+                   mutate(var = "Time 45"),
+                 ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time60_700,.))) %>%
+                   mutate(var = "Time 60"),
+                 ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time90_700,.))) %>%
+                   mutate(var = "Time 90")) %>%
+  gather(key="group",value="ac",-c(var))
+
+means715 <- rbind(ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time30_715,.))) %>%
+                   mutate(var = "Time 30"),
+                  ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time45_715,.))) %>%
+                   mutate(var = "Time 45"),
+                 ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time60_715,.))) %>%
+                   mutate(var = "Time 60"),
+                 ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time90_715,.))) %>%
+                   mutate(var = "Time 90")) %>%
+  gather(key="group",value="ac",-c(var))
+
+means730 <- rbind(ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time30_730,.))) %>%
+                   mutate(var = "Time 30"),
+                  ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time45_730,.))) %>%
+                   mutate(var = "Time 45"),
+                 ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time60_730,.))) %>%
+                   mutate(var = "Time 60"),
+                 ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time90_730,.))) %>%
+                   mutate(var = "Time 90")) %>%
+  gather(key="group",value="ac",-c(var))
+
+means745 <- rbind(ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time30_745,.))) %>%
+                   mutate(var = "Time 30"),
+                  ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time45_745,.))) %>%
+                   mutate(var = "Time 45"),
+                 ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time60_745,.))) %>%
+                   mutate(var = "Time 60"),
+                 ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time90_745,.))) %>%
+                   mutate(var = "Time 90")) %>%
+  gather(key="group",value="ac",-c(var))
+
+means800 <- rbind(ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time30_800,.))) %>%
+                   mutate(var = "Time 30"),
+                  ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time45_800,.))) %>%
+                   mutate(var = "Time 45"),
+                 ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time60_800,.))) %>%
+                   mutate(var = "Time 60"),
+                 ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time90_800,.))) %>%
+                   mutate(var = "Time 90")) %>%
+  gather(key="group",value="ac",-c(var))
+
+
+means <- rbind(means700 %>% mutate(Departure="7:00"),
+               means715 %>% mutate(Departure="7:15"),
+               means730 %>% mutate(Departure="7:30"),
+               means745 %>% mutate(Departure="7:45"),
+               means800 %>% mutate(Departure="8:00"))
+
+means$group <- case_when(means$group == "hi_wh" ~ "Upper\nwhite",
+                         means$group == "hi_ot" ~ "Upper\nother",
+                         means$group == "hi_bl" ~ "Upper\nblack",
+                         means$group == "md_wh" ~ "Middle\nwhite",
+                         means$group == "md_ot" ~ "Middle\nother",
+                         means$group == "md_bl" ~ "Middle\nblack",
+                         means$group == "lo_wh" ~ "Lower\nwhite",
+                         means$group == "lo_ot" ~ "Lower\nother",
+                         means$group == "lo_bl" ~ "Lower\nblack")
+means$group <- factor(means$group,levels=c("Upper\nwhite","Upper\nother","Upper\nblack","Middle\nwhite","Middle\nother","Middle\nblack","Lower\nwhite","Lower\nother","Lower\nblack"))
+
+
+ggplot() +
+  geom_line(data=means,aes(x=group,y=ac,group=interaction(var,Departure),color=Departure),size=1,alpha=0.8)+
+  scale_color_manual(values = magma(7)[2:6]) +
+  facet_wrap(~var) +
+  theme_minimal() +
+  theme(legend.position = "bottom") +
+  ylab('Average accessibility') +
+  xlab('Group') +
+  ylim(0,0.6)
+ggsave("Cities/robstness_nyc.jpeg",dpi=600,height = 6,width=8)
+
+# LON
+ac700 <- st_read("Cities/London/lon_access_cum.shp") %>% st_drop_geometry()
+ac715 <- st_read("Cities/London/lon_access_cum715.shp") %>% select("GEO_ID","time30","time45","time60","time90") %>% st_drop_geometry()
+ac730 <- st_read("Cities/London/lon_access_cum730.shp")%>% select("GEO_ID","time30","time45","time60","time90") %>% st_drop_geometry()
+ac745 <- st_read("Cities/London/lon_access_cum745.shp")%>% select("GEO_ID","time30","time45","time60","time90") %>% st_drop_geometry()
+ac800 <- st_read("Cities/London/lon_access_cum800.shp")%>% select("GEO_ID","time30","time45","time60","time90") %>% st_drop_geometry()
+
+ids <- Reduce(intersect,list(ac700$GEO_ID,ac715$GEO_ID,ac730$GEO_ID,ac800$GEO_ID))
+
+ac700 <- ac700 %>% filter(GEO_ID %in% ids) %>% arrange(GEO_ID) %>%
+  rename_at(c("time30","time45","time60","time90"),~(p=paste0(.,"_700")))
+ac715 <- ac715 %>% filter(GEO_ID %in% ids) %>% arrange(GEO_ID)%>%
+  select("GEO_ID","time30","time45","time60","time90") %>%
+  rename_at(c("time30","time45","time60","time90"),~(p=paste0(.,"_715"))) 
+ac730 <- ac730 %>% filter(GEO_ID %in% ids) %>% arrange(GEO_ID)%>%
+  select("GEO_ID","time30","time45","time60","time90")%>%
+  rename_at(c("time30","time45","time60","time90"),~(p=paste0(.,"_730")))
+ac745 <- ac745 %>% filter(GEO_ID %in% ids) %>% arrange(GEO_ID)%>%
+  select("GEO_ID","time30","time45","time60","time90")%>%
+  rename_at(c("time30","time45","time60","time90"),~(p=paste0(.,"_745")))
+ac800 <- ac800 %>% filter(GEO_ID %in% ids) %>% arrange(GEO_ID)%>%
+  select("GEO_ID","time30","time45","time60","time90")%>%
+  rename_at(c("time30","time45","time60","time90"),~(p=paste0(.,"_800")))
+
+ac <- ac700 %>% left_join(ac715,by="GEO_ID") %>% left_join(ac730,by="GEO_ID")%>% left_join(ac745,by="GEO_ID") %>% left_join(ac800,by="GEO_ID") %>%
+  na.omit()
+
+#Time
+ac %>% select(time30_700,time30_715,time30_730,time30_745,time30_800) %>% cor()
+ac %>% select(time45_700,time45_715,time45_730,time45_745,time45_800) %>% cor()
+ac %>% select(time60_700,time60_715,time60_730,time60_745,time60_800) %>% cor()
+ac %>% select(time90_700,time90_715,time90_730,time90_745,time90_800) %>% cor()
+
+
+means700 <- rbind(ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time30_700,.))) %>%
+                   mutate(var = "Time 30"),
+                  ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time45_700,.))) %>%
+                   mutate(var = "Time 45"),
+                 ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time60_700,.))) %>%
+                   mutate(var = "Time 60"),
+                 ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time90_700,.))) %>%
+                   mutate(var = "Time 90")) %>%
+  gather(key="group",value="ac",-c(var))
+
+means715 <- rbind(ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time30_715,.))) %>%
+                   mutate(var = "Time 30"),
+                  ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time45_715,.))) %>%
+                   mutate(var = "Time 45"),
+                 ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time60_715,.))) %>%
+                   mutate(var = "Time 60"),
+                 ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time90_715,.))) %>%
+                   mutate(var = "Time 90")) %>%
+  gather(key="group",value="ac",-c(var))
+
+means730 <- rbind(ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time30_730,.))) %>%
+                   mutate(var = "Time 30"),
+                  ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time45_730,.))) %>%
+                   mutate(var = "Time 45"),
+                 ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time60_730,.))) %>%
+                   mutate(var = "Time 60"),
+                 ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time90_730,.))) %>%
+                   mutate(var = "Time 90")) %>%
+  gather(key="group",value="ac",-c(var))
+
+means745 <- rbind(ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time30_745,.))) %>%
+                   mutate(var = "Time 30"),
+                  ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time45_745,.))) %>%
+                   mutate(var = "Time 45"),
+                 ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time60_745,.))) %>%
+                   mutate(var = "Time 60"),
+                 ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time90_745,.))) %>%
+                   mutate(var = "Time 90")) %>%
+  gather(key="group",value="ac",-c(var))
+
+means800 <- rbind(ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time30_800,.))) %>%
+                   mutate(var = "Time 30"),
+                  ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time45_800,.))) %>%
+                   mutate(var = "Time 45"),
+                 ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time60_800,.))) %>%
+                   mutate(var = "Time 60"),
+                 ac %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.mean(time90_800,.))) %>%
+                   mutate(var = "Time 90")) %>%
+  gather(key="group",value="ac",-c(var))
+
+
+means <- rbind(means700 %>% mutate(Departure="7:00"),
+               means715 %>% mutate(Departure="7:15"),
+               means730 %>% mutate(Departure="7:30"),
+               means745 %>% mutate(Departure="7:45"),
+               means800 %>% mutate(Departure="8:00"))
+
+means$group <- case_when(means$group == "hi_wh" ~ "Upper\nwhite",
+                         means$group == "hi_ot" ~ "Upper\nother",
+                         means$group == "hi_bl" ~ "Upper\nblack",
+                         means$group == "md_wh" ~ "Middle\nwhite",
+                         means$group == "md_ot" ~ "Middle\nother",
+                         means$group == "md_bl" ~ "Middle\nblack",
+                         means$group == "lo_wh" ~ "Lower\nwhite",
+                         means$group == "lo_ot" ~ "Lower\nother",
+                         means$group == "lo_bl" ~ "Lower\nblack")
+means$group <- factor(means$group,levels=c("Upper\nwhite","Upper\nother","Upper\nblack","Middle\nwhite","Middle\nother","Middle\nblack","Lower\nwhite","Lower\nother","Lower\nblack"))
+
+
+ggplot() +
+  geom_line(data=means,aes(x=group,y=ac,group=interaction(var,Departure),color=Departure),size=1,alpha=0.8)+
+  scale_color_manual(values = magma(7)[2:6]) +
+  facet_wrap(~var) +
+  theme_minimal() +
+  theme(legend.position = "bottom") +
+  ylab('Average accessibility') +
+  xlab('Group') +
+  ylim(0,0.6)
+ggsave("Cities/robstness_lon.jpeg",dpi=600,height = 6,width=8)
+
+```
+
