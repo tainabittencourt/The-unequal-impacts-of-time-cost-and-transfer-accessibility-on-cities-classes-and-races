@@ -1,0 +1,1215 @@
+---
+title: "center_periphery_inequalities"
+output: pdf_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F, cache = T, warning = F, message = F, error = F)
+
+library(tidyverse)
+library(foreign)
+library(splitstackshape)
+#library(Zelig)
+library(stats)
+library(outliers)
+library(rgdal)
+library(sf)
+library(matrixStats)
+library(scales)
+library(DescTools)
+library(interactions)
+library(Hmisc)
+library(sandwich)
+library(spgwr)
+library(raster)
+library(rgeos)
+library(rgdal)
+library(mipfp)
+library(ipfp)
+library(osmdata)
+library(readxl)
+library(hrbrthemes)
+library(viridis)
+library(corrplot)
+
+mutate <- dplyr::mutate
+select <- dplyr::select
+filter <- dplyr::filter
+rename <- dplyr::rename
+distinct <- dplyr::distinct
+pull <- dplyr::pull
+summarise <- dplyr::summarise
+
+weighted.ttest.ci <- function(x, weights, conf.level = 0.95) {
+    require(Hmisc)
+    nx <- length(x)
+    df <- nx - 1
+    vx <- wtd.var(x, weights, normwt = TRUE) ## From Hmisc
+    mx <- weighted.means(x, weights)
+    stderr <- sqrt(vx/nx)
+    tstat <- mx/stderr ## not mx - mu
+    alpha <- 1 - conf.level
+    cint <- qt(1 - alpha/2, df)
+    cint <- tstat + c(-cint, cint)
+    cint * stderr
+}
+
+```
+
+# Social classes
+
+```{r access_class_sp}
+
+classes_sp <- readRDS("Cities/Sao Paulo/sp_soc_sc.rds") %>%
+  mutate_all(as.character) %>% mutate_all(as.numeric) %>%
+  mutate_all(.,~(replace_na(.,0))) %>%
+  mutate(hi_wh = white1+white2,
+         md_wh = white3+white4+white5+white6+white7,
+         lo_wh = white8+white9,
+         hi_bl = black1+black2,
+         md_bl = black3+black4+black5+black6+black7,
+         lo_bl = black8+black9,
+         hi_ot = other1+other2,
+         md_ot = other3+other4+other5+other6+other7,
+         lo_ot = other8+other9) %>%
+  filter(substr(CD_GEOCODI,1,7) == "3550308") %>%
+  select(CD_GEOCODI,hi_wh,hi_bl,hi_ot,md_wh,md_bl,md_ot,lo_wh,lo_bl,lo_ot) %>%
+  mutate(CD_GEOCODI=as.character(CD_GEOCODI))
+
+# Read
+classes <-  st_read("Cities/Sao Paulo/sp_ct_hex.shp")  %>%
+  mutate(CD_GEOCODI = as.character(CD_GEOCODI)) %>%
+  select(CD_GEOCODI,GEO_ID) %>%
+  mutate(area_polygon = as.numeric(st_area(.))) %>%
+  st_drop_geometry() %>%
+  select(CD_GEOCODI,GEO_ID,area_polygon) %>%
+  group_by(CD_GEOCODI) %>%
+  mutate(area_ct = sum(area_polygon,na.rm = T)) %>%
+  ungroup() %>%
+  left_join(classes_sp,by="CD_GEOCODI") %>%
+  mutate_at(c("hi_wh","hi_bl","hi_ot","md_wh","md_bl","md_ot","lo_wh","lo_bl","lo_ot"),~(p = .*area_polygon/area_ct)) %>%
+  group_by(GEO_ID) %>%
+  summarize_at(c("hi_wh","hi_bl","hi_ot","md_wh","md_bl","md_ot","lo_wh","lo_bl","lo_ot"),~(p = sum(.,na.rm = T))) %>%
+  ungroup() %>%
+  mutate(GEO_ID = as.character(GEO_ID))
+
+
+st_read("Cities/Sao Paulo/sp_access_cum.shp") %>%
+  left_join(classes,by="GEO_ID") %>%
+  st_write("Cities/Sao Paulo/sp_access_cum.shp",delete_layer=T)
+
+st_read("Cities/Sao Paulo/sp_access_sim_cum.shp") %>%
+  left_join(classes,by="GEO_ID") %>%
+  st_write("Cities/Sao Paulo/sp_access_sim_cum.shp",delete_layer=T)
+
+```
+
+```{r access_class_nyc}
+
+classes_nyc <- readRDS("Cities/NYC/nyc_soc_ct.rds") %>%
+  mutate_all(as.character) %>% mutate_all(as.numeric) %>%
+  mutate_all(.,~(replace_na(.,0))) %>%
+  mutate(hi_wh = white1+white2,
+         md_wh = white3+white4+white5+white6+white7,
+         lo_wh = white8+white9,
+         hi_bl = black2,
+         md_bl = black3+black4+black5+black6+black7,
+         lo_bl = black8+black9,
+         hi_ot = other1+other2,
+         md_ot = other3+other4+other5+other6+other7,
+         lo_ot = other8+other9) %>%
+  select(O_TRACT,hi_wh,hi_bl,hi_ot,md_wh,md_bl,md_ot,lo_wh,lo_bl,lo_ot) %>%
+  mutate(O_TRACT=as.character(O_TRACT))
+
+# Read
+classes <-  st_read("Cities/NYC/nyc_ct_hex.shp") %>%
+  mutate(O_TRACT = paste0(STATE,COUNTY,ct2010)) %>%
+  mutate(O_TRACT = as.character(O_TRACT)) %>%
+  select(O_TRACT,GEO_ID) %>%
+  mutate(area_polygon = as.numeric(st_area(.))) %>%
+  st_drop_geometry() %>%
+  select(O_TRACT,GEO_ID,area_polygon) %>%
+  group_by(O_TRACT) %>%
+  mutate(area_ct = sum(area_polygon,na.rm = T)) %>%
+  ungroup() %>%
+  left_join(classes_nyc,by="O_TRACT") %>%
+  mutate_at(c("hi_wh","hi_bl","hi_ot","md_wh","md_bl","md_ot","lo_wh","lo_bl","lo_ot"),~(p = .*area_polygon/area_ct)) %>%
+  group_by(GEO_ID) %>%
+  summarize_at(c("hi_wh","hi_bl","hi_ot","md_wh","md_bl","md_ot","lo_wh","lo_bl","lo_ot"),~(p = sum(.,na.rm = T))) %>%
+  ungroup() %>%
+  mutate(GEO_ID = as.character(GEO_ID))
+
+st_read("Cities/NYC/nyc_access_cum.shp") %>%
+  left_join(classes,by="GEO_ID") %>%
+  st_write("Cities/NYC/nyc_access_cum.shp",delete_layer=T)
+
+st_read("Cities/NYC/nyc_access_sim_cum.shp") %>%
+  left_join(classes,by="GEO_ID") %>%
+  st_write("Cities/NYC/nyc_access_sim_cum.shp",delete_layer=T)
+
+```
+
+```{r access_class_lon}
+
+classes_lon <- readRDS("Cities/London/lon_soc_lsoa.rds") %>%
+  mutate_all(.,~(replace_na(.,0))) %>%
+  mutate(hi_wh = white1+white2,
+         md_wh = white3+white4+white5+white6+white7,
+         lo_wh = white8+white9,
+         hi_bl = black1+black2,
+         md_bl = black3+black4+black5+black6+black7,
+         lo_bl = black8+black9,
+         hi_ot = other1+other2,
+         md_ot = other3+other4+other5+other6+other7,
+         lo_ot = other8+other9) %>%
+  select(GEO_CODE,hi_wh,hi_bl,hi_ot,md_wh,md_bl,md_ot,lo_wh,lo_bl,lo_ot) %>%
+  mutate(GEO_CODE=as.character(GEO_CODE))
+
+# Read
+classes <-  st_read("Cities/London/lon_LSOA_hex.shp") %>%
+  mutate(GEO_CODE = as.character(LSOA11CD)) %>%
+  select(GEO_CODE,GEO_ID) %>%
+  mutate(area_polygon = as.numeric(st_area(.))) %>%
+  st_drop_geometry() %>%
+  select(GEO_CODE,GEO_ID,area_polygon) %>%
+  group_by(GEO_CODE) %>%
+  mutate(area_ct = sum(area_polygon,na.rm = T)) %>%
+  ungroup() %>%
+  left_join(classes_lon,by="GEO_CODE") %>%
+  mutate_at(c("hi_wh","hi_bl","hi_ot","md_wh","md_bl","md_ot","lo_wh","lo_bl","lo_ot"),~(p = .*area_polygon/area_ct)) %>%
+  group_by(GEO_ID) %>%
+  summarize_at(c("hi_wh","hi_bl","hi_ot","md_wh","md_bl","md_ot","lo_wh","lo_bl","lo_ot"),~(p = sum(.,na.rm = T))) %>%
+  ungroup() %>%
+  mutate(GEO_ID = as.character(GEO_ID))
+
+
+access <- st_read("Cities/London/lon_access_cum.shp") %>%
+  left_join(classes,by="GEO_ID") %>%
+  st_write("Cities/London/lon_access_cum.shp",delete_layer=T)
+
+access_sim <- st_read("Cities/London/lon_access_sim_cum.shp") %>%
+  left_join(classes,by="GEO_ID")  %>%
+  st_write("Cities/London/lon_access_sim_cum.shp",delete_layer=T)
+
+```
+
+# Groups - Population
+
+```{r groups_pop}
+
+st_read("Cities/Sao Paulo/sp_access_cum.shp") %>%
+  st_drop_geometry() %>%
+  mutate(workers = hi_wh+hi_bl+hi_ot+md_wh+md_bl+md_ot+lo_wh+lo_bl+lo_ot) %>%
+  summarise_at(c("hi_wh","hi_bl","hi_ot","md_wh","md_bl","md_ot","lo_wh","lo_bl","lo_ot"),~(p=round(100*sum(.,na.rm=T)/sum(workers,na.rm=T),1))) %>% mutate(City = "São Paulo") %>%
+  rbind(st_read("Cities/NYC/nyc_access_cum.shp") %>%
+  st_drop_geometry() %>%
+  mutate(workers = hi_wh+hi_bl+hi_ot+md_wh+md_bl+md_ot+lo_wh+lo_bl+lo_ot) %>%
+  summarise_at(c("hi_wh","hi_bl","hi_ot","md_wh","md_bl","md_ot","lo_wh","lo_bl","lo_ot"),~(p=round(100*sum(.,na.rm=T)/sum(workers,na.rm=T),1))) %>% mutate(City = "New York City")) %>%
+  rbind(st_read("Cities/London/lon_access_cum.shp") %>%
+  st_drop_geometry() %>%
+  mutate(workers = hi_wh+hi_bl+hi_ot+md_wh+md_bl+md_ot+lo_wh+lo_bl+lo_ot) %>%
+  summarise_at(c("hi_wh","hi_bl","hi_ot","md_wh","md_bl","md_ot","lo_wh","lo_bl","lo_ot"),~(p=round(100*sum(.,na.rm=T)/sum(workers,na.rm=T),1))) %>% mutate(City = "London"))
+
+```
+
+
+# Accessibility Inequality
+
+```{r access_gini}
+
+access <- st_read("Cities/Sao Paulo/sp_access_cum.shp") %>%
+  st_drop_geometry()
+access_sim <- st_read("Cities/Sao Paulo/sp_access_sim_cum.shp") %>%
+  st_drop_geometry()
+
+# Gini
+gini_sp <- tibble(
+  dimension = c(rep("Time",5),rep("Cost",5),rep("Transfers",5),rep("Time10",5),rep("Time20",5),rep("Time30",5)),
+  metric = c(30,45,60,90,120,5,10,20,30,40,0,1,2,3,4,30,45,60,90,120,30,45,60,90,120,30,45,60,90,120),
+  gini = c(Gini(access$time30,access$pop,na.rm = T),
+           Gini(access$time45,access$pop,na.rm=T),
+           Gini(access$time60,access$pop,na.rm=T),
+           Gini(access$time90,access$pop,na.rm=T),
+           Gini(access$time120,access$pop,na.rm=T),
+           Gini(access$cost5,access$pop,na.rm = T),
+           Gini(access$cost10,access$pop,na.rm=T),
+           Gini(access$cost20,access$pop,na.rm=T),
+           Gini(access$cost30,access$pop,na.rm=T),
+           Gini(access$cost40,access$pop,na.rm=T),
+           Gini(access$board0,access$pop,na.rm = T),
+           Gini(access$board1,access$pop,na.rm=T),
+           Gini(access$board2,access$pop,na.rm=T),
+           Gini(access$board3,access$pop,na.rm=T),
+           Gini(access$board4,access$pop,na.rm=T),
+           Gini(access_sim$time30_10,access_sim$pop,na.rm = T),
+           Gini(access_sim$time45_10,access_sim$pop,na.rm=T),
+           Gini(access_sim$time60_10,access_sim$pop,na.rm=T),
+           Gini(access_sim$time90_10,access_sim$pop,na.rm=T),
+           Gini(access_sim$time120_10,access_sim$pop,na.rm=T),
+           Gini(access_sim$time30_20,access_sim$pop,na.rm = T),
+           Gini(access_sim$time45_20,access_sim$pop,na.rm=T),
+           Gini(access_sim$time60_20,access_sim$pop,na.rm=T),
+           Gini(access_sim$time90_20,access_sim$pop,na.rm=T),
+           Gini(access_sim$time120_20,access_sim$pop,na.rm=T),
+           Gini(access_sim$time30_30,access_sim$pop,na.rm = T),
+           Gini(access_sim$time45_30,access_sim$pop,na.rm=T),
+           Gini(access_sim$time60_30,access_sim$pop,na.rm=T),
+           Gini(access_sim$time90_30,access_sim$pop,na.rm=T),
+           Gini(access_sim$time120_30,access_sim$pop,na.rm=T)))
+
+
+access <- st_read("Cities/NYC/nyc_access_cum.shp") %>%
+  st_drop_geometry()
+access_sim <- st_read("Cities/NYC/nyc_access_sim_cum.shp") %>%
+  st_drop_geometry()
+
+# Gini
+gini_nyc <- tibble(
+  dimension = c(rep("Time",5),rep("Cost",5),rep("Transfers",5),rep("Time10",5),rep("Time20",5),rep("Time30",5)),
+  metric = c(30,45,60,90,120,5,10,20,30,40,0,1,2,3,4,30,45,60,90,120,30,45,60,90,120,30,45,60,90,120),
+  gini = c(Gini(access$time30,access$pop,na.rm = T),
+           Gini(access$time45,access$pop,na.rm=T),
+           Gini(access$time60,access$pop,na.rm=T),
+           Gini(access$time90,access$pop,na.rm=T),
+           Gini(access$time120,access$pop,na.rm=T),
+           Gini(access$cost5,access$pop,na.rm = T),
+           Gini(access$cost10,access$pop,na.rm=T),
+           Gini(access$cost20,access$pop,na.rm=T),
+           Gini(access$cost30,access$pop,na.rm=T),
+           Gini(access$cost40,access$pop,na.rm=T),
+           Gini(access$board0,access$pop,na.rm = T),
+           Gini(access$board1,access$pop,na.rm=T),
+           Gini(access$board2,access$pop,na.rm=T),
+           Gini(access$board3,access$pop,na.rm=T),
+           Gini(access$board4,access$pop,na.rm=T),
+           Gini(access_sim$time30_10,access_sim$pop,na.rm = T),
+           Gini(access_sim$time45_10,access_sim$pop,na.rm=T),
+           Gini(access_sim$time60_10,access_sim$pop,na.rm=T),
+           Gini(access_sim$time90_10,access_sim$pop,na.rm=T),
+           Gini(access_sim$time120_10,access_sim$pop,na.rm=T),
+           Gini(access_sim$time30_20,access_sim$pop,na.rm = T),
+           Gini(access_sim$time45_20,access_sim$pop,na.rm=T),
+           Gini(access_sim$time60_20,access_sim$pop,na.rm=T),
+           Gini(access_sim$time90_20,access_sim$pop,na.rm=T),
+           Gini(access_sim$time120_20,access_sim$pop,na.rm=T),
+           Gini(access_sim$time30_30,access_sim$pop,na.rm = T),
+           Gini(access_sim$time45_30,access_sim$pop,na.rm=T),
+           Gini(access_sim$time60_30,access_sim$pop,na.rm=T),
+           Gini(access_sim$time90_30,access_sim$pop,na.rm=T),
+           Gini(access_sim$time120_30,access_sim$pop,na.rm=T)))
+  
+access <- st_read("Cities/London/lon_access_cum.shp") %>%
+  st_drop_geometry()
+access_sim <- st_read("Cities/London/lon_access_sim_cum.shp") %>%
+  st_drop_geometry()
+
+# Gini
+gini_lon <- tibble(
+  dimension = c(rep("Time",5),rep("Cost",5),rep("Transfers",5),rep("Time10",5),rep("Time20",5),rep("Time30",5)),
+  metric = c(30,45,60,90,120,5,10,20,30,40,0,1,2,3,4,30,45,60,90,120,30,45,60,90,120,30,45,60,90,120),
+  gini = c(Gini(access$time30,access$pop,na.rm = T),
+           Gini(access$time45,access$pop,na.rm=T),
+           Gini(access$time60,access$pop,na.rm=T),
+           Gini(access$time90,access$pop,na.rm=T),
+           Gini(access$time120,access$pop,na.rm=T),
+           Gini(access$cost5,access$pop,na.rm = T),
+           Gini(access$cost10,access$pop,na.rm=T),
+           Gini(access$cost20,access$pop,na.rm=T),
+           Gini(access$cost30,access$pop,na.rm=T),
+           Gini(access$cost40,access$pop,na.rm=T),
+           Gini(access$board0,access$pop,na.rm = T),
+           Gini(access$board1,access$pop,na.rm=T),
+           Gini(access$board2,access$pop,na.rm=T),
+           Gini(access$board3,access$pop,na.rm=T),
+           Gini(access$board4,access$pop,na.rm=T),
+           Gini(access_sim$time30_10,access_sim$pop,na.rm = T),
+           Gini(access_sim$time45_10,access_sim$pop,na.rm=T),
+           Gini(access_sim$time60_10,access_sim$pop,na.rm=T),
+           Gini(access_sim$time90_10,access_sim$pop,na.rm=T),
+           Gini(access_sim$time120_10,access_sim$pop,na.rm=T),
+           Gini(access_sim$time30_20,access_sim$pop,na.rm = T),
+           Gini(access_sim$time45_20,access_sim$pop,na.rm=T),
+           Gini(access_sim$time60_20,access_sim$pop,na.rm=T),
+           Gini(access_sim$time90_20,access_sim$pop,na.rm=T),
+           Gini(access_sim$time120_20,access_sim$pop,na.rm=T),
+           Gini(access_sim$time30_30,access_sim$pop,na.rm = T),
+           Gini(access_sim$time45_30,access_sim$pop,na.rm=T),
+           Gini(access_sim$time60_30,access_sim$pop,na.rm=T),
+           Gini(access_sim$time90_30,access_sim$pop,na.rm=T),
+           Gini(access_sim$time120_30,access_sim$pop,na.rm=T)))
+
+gini <- gini_sp %>% mutate(City = "São Paulo") %>% rbind(gini_nyc %>% mutate(City = "New York City")) %>% rbind(gini_lon %>% mutate(City = "London")) %>%
+  mutate(dimension = factor(dimension,levels=c("Time","Cost","Transfers","Time10","Time20","Time30"))) %>% arrange(dimension) %>%
+mutate(City = factor(City,levels=c("São Paulo","New York City","London"))) %>%
+  mutate(metric=factor(as.character(metric),levels=c("0","1","2","3","4","5","10","20","30","40","45","60","90","120"))) %>%
+  filter(dimension %in% c("Time","Cost","Transfers","Time20"))
+
+gini %>%
+  ggplot(aes(x=metric,y=gini,color=City,group=City)) +
+  geom_point(alpha=0.8) +
+  geom_line(size=1,alpha=0.8) +
+  facet_wrap(~dimension,scales = "free") +
+  scale_color_viridis_d(option="A",begin=0.3,end=0.7) +
+  ylim(0,1) +
+  xlab("Threshold") +
+  ylab("Gini") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+  
+ggsave("Cities/sp_nyc_lon_gini_cum.jpeg",dpi=600,height = 5,width=7.5)
+
+```
+
+```{r access_means}
+weighted.ttest.ci <- function(x, weights, conf.level = 0.95) {
+    require(Hmisc)
+  a <- tibble(x,weights) %>% na.omit()
+  x <- a$x
+  weights <- a$weights
+    nx <- length(x)
+    df <- nx - 1
+    vx <- wtd.var(x, weights, normwt = TRUE) ## From Hmisc
+    mx <- weighted.mean(x, weights)
+    stderr <- sqrt(vx/nx)
+    tstat <- mx/stderr ## not mx - mu
+    alpha <- 1 - conf.level
+    cint <- qt(1 - alpha/2, df)
+    cint <- (tstat + c(-cint, cint))*stderr
+    cint <- c(mx,cint)
+    return(cint)}
+
+access <- st_read("Cities/Sao Paulo/sp_access_cum.shp") %>%
+  st_drop_geometry()
+access_sim <- st_read("Cities/Sao Paulo/sp_access_sim_cum.shp") %>%
+  st_drop_geometry()
+
+#Means
+means_sp <- rbind(access %>%
+                   summarise_at(c("hi_wh","hi_bl","md_wh","md_bl","lo_wh","lo_bl"),
+                                ~(p = weighted.ttest.ci(time45,.))) %>%
+                   mutate(var = "Time 45"),
+                  access %>%
+                   summarise_at(c("hi_wh","hi_bl","md_wh","md_bl","lo_wh","lo_bl"),
+                                ~(p = weighted.ttest.ci(time60,.))) %>%
+                   mutate(var = "Time 60"),
+                  access %>%
+                   summarise_at(c("hi_wh","hi_bl","md_wh","md_bl","lo_wh","lo_bl"),
+                                ~(p = weighted.ttest.ci(cost10,.))) %>%
+                   mutate(var = "Cost 10"),
+                 access %>%
+                   summarise_at(c("hi_wh","hi_bl","md_wh","md_bl","lo_wh","lo_bl"),
+                                ~(p = weighted.ttest.ci(cost20,.))) %>%
+                   mutate(var = "Cost 20"),
+                 access %>%
+                   summarise_at(c("hi_wh","hi_bl","md_wh","md_bl","lo_wh","lo_bl"),
+                                ~(p = weighted.ttest.ci(board1,.))) %>%
+                   mutate(var = "Transfers 1"),
+                 access %>%
+                   summarise_at(c("hi_wh","hi_bl","md_wh","md_bl","lo_wh","lo_bl"),
+                                ~(p = weighted.ttest.ci(board2,.))) %>%
+                   mutate(var = "Transfers 2"),
+                 access_sim %>%
+                   summarise_at(c("hi_wh","hi_bl","md_wh","md_bl","lo_wh","lo_bl"),
+                                ~(p = weighted.ttest.ci(time60_20,.))) %>%
+                   mutate(var = "Time 60 - Cost 20 - Transfers 2")) %>%
+  gather(key="group",value="ac",-c(var))
+means_sp$measure <- rep(c("mean","ci_low","ci_high"),nrow(means_sp)/3)
+
+access <- st_read("Cities/NYC/nyc_access_cum.shp") %>%
+  st_drop_geometry()
+access_sim <- st_read("Cities/NYC/nyc_access_sim_cum.shp") %>%
+  st_drop_geometry()
+
+#Means
+means_nyc <- rbind(access %>%
+                   summarise_at(c("hi_wh","hi_bl","md_wh","md_bl","lo_wh","lo_bl"),
+                                ~(p = weighted.ttest.ci(time45,.))) %>%
+                   mutate(var = "Time 45"),
+                  access %>%
+                   summarise_at(c("hi_wh","hi_bl","md_wh","md_bl","lo_wh","lo_bl"),
+                                ~(p = weighted.ttest.ci(time60,.))) %>%
+                   mutate(var = "Time 60"),
+                  access %>%
+                   summarise_at(c("hi_wh","hi_bl","md_wh","md_bl","lo_wh","lo_bl"),
+                                ~(p = weighted.ttest.ci(cost10,.))) %>%
+                   mutate(var = "Cost 10"),
+                 access %>%
+                   summarise_at(c("hi_wh","hi_bl","md_wh","md_bl","lo_wh","lo_bl"),
+                                ~(p = weighted.ttest.ci(cost20,.))) %>%
+                   mutate(var = "Cost 20"),
+                 access %>%
+                   summarise_at(c("hi_wh","hi_bl","md_wh","md_bl","lo_wh","lo_bl"),
+                                ~(p = weighted.ttest.ci(board1,.))) %>%
+                   mutate(var = "Transfers 1"),
+                 access %>%
+                   summarise_at(c("hi_wh","hi_bl","md_wh","md_bl","lo_wh","lo_bl"),
+                                ~(p = weighted.ttest.ci(board2,.))) %>%
+                   mutate(var = "Transfers 2"),
+                 access_sim %>%
+                   summarise_at(c("hi_wh","hi_bl","md_wh","md_bl","lo_wh","lo_bl"),
+                                ~(p = weighted.ttest.ci(time60_20,.))) %>%
+                   mutate(var = "Time 60 - Cost 20 - Transfers 2")) %>%
+  gather(key="group",value="ac",-c(var))
+means_nyc$measure <- rep(c("mean","ci_low","ci_high"),nrow(means_nyc)/3)
+
+access <- st_read("Cities/London/lon_access_cum.shp") %>%
+  st_drop_geometry()
+access_sim <- st_read("Cities/London/lon_access_sim_cum.shp") %>%
+  st_drop_geometry()
+
+#Means
+means_lon <- rbind(access %>%
+                   summarise_at(c("hi_wh","hi_bl","md_wh","md_bl","lo_wh","lo_bl"),
+                                ~(p = weighted.ttest.ci(time45,.))) %>%
+                   mutate(var = "Time 45"),
+                  access %>%
+                   summarise_at(c("hi_wh","hi_bl","md_wh","md_bl","lo_wh","lo_bl"),
+                                ~(p = weighted.ttest.ci(time60,.))) %>%
+                   mutate(var = "Time 60"),
+                  access %>%
+                   summarise_at(c("hi_wh","hi_bl","md_wh","md_bl","lo_wh","lo_bl"),
+                                ~(p = weighted.ttest.ci(cost10,.))) %>%
+                   mutate(var = "Cost 10"),
+                 access %>%
+                   summarise_at(c("hi_wh","hi_bl","md_wh","md_bl","lo_wh","lo_bl"),
+                                ~(p = weighted.ttest.ci(cost20,.))) %>%
+                   mutate(var = "Cost 20"),
+                 access %>%
+                   summarise_at(c("hi_wh","hi_bl","md_wh","md_bl","lo_wh","lo_bl"),
+                                ~(p = weighted.ttest.ci(board1,.))) %>%
+                   mutate(var = "Transfers 1"),
+                 access %>%
+                   summarise_at(c("hi_wh","hi_bl","md_wh","md_bl","lo_wh","lo_bl"),
+                                ~(p = weighted.ttest.ci(board2,.))) %>%
+                   mutate(var = "Transfers 2"),
+                 access_sim %>%
+                   summarise_at(c("hi_wh","hi_bl","md_wh","md_bl","lo_wh","lo_bl"),
+                                ~(p = weighted.ttest.ci(time60_20,.))) %>%
+                   mutate(var = "Time 60 - Cost 20 - Transfers 2")) %>%
+  gather(key="group",value="ac",-c(var))
+means_lon$measure <- rep(c("mean","ci_low","ci_high"),nrow(means_lon)/3)
+
+
+means <- means_sp %>% mutate(City = "São Paulo") %>%
+  rbind(means_nyc %>% mutate(City = "New York City"))%>%
+  rbind(means_lon %>% mutate(City = "London"))
+means$group <- factor(means$group,levels=c("hi_wh","hi_bl","md_wh","md_bl","lo_wh","lo_bl"))
+means$City = factor(means$City,levels=c("São Paulo","New York City","London"))
+means$group <- case_when(means$group == "hi_wh" ~ "Upper\nwhite",
+                         means$group == "hi_bl" ~ "Upper\nblack",
+                         means$group == "md_wh" ~ "Middle\nwhite",
+                         means$group == "md_bl" ~ "Middle\nblack",
+                         means$group == "lo_wh" ~ "Lower\nwhite",
+                         means$group == "lo_bl" ~ "Lower\nblack")
+means$group <- factor(means$group,levels=c("Upper\nwhite","Upper\nblack","Middle\nwhite","Middle\nblack","Lower\nwhite","Lower\nblack"))
+
+means$dimension <- rep(c("- - - - Time 45   ――― Time 60","- - - - Time 45   ――― Time 60","- - - - Cost 10    ――― Cost 20","- - - - Cost 10    ――― Cost 20","- - - - Transfers 1    ――― Transfers 2","- - - - Transfers 1    ――― Transfers 2","――― Time 60 + Cost 20 + Transfers 2"),each=3)
+means$dimension <- factor(means$dimension,levels = c("- - - - Time 45   ――― Time 60","- - - - Transfers 1    ――― Transfers 2","- - - - Cost 10    ――― Cost 20","――― Time 60 + Cost 20 + Transfers 2"))
+means$line <- rep(c("l1","l2",'l1',"l2","l1","l2","l2"),each=3)
+means$line <- factor(means$line,levels=c("l2","l1"))
+
+
+## Line plot
+ggplot() +
+  geom_line(aes(x=group,y=ac,color=City,group=interaction(City,var),linetype=line),
+            size=1,alpha=1,
+            data=means %>%
+              filter(measure == "mean") %>%
+              mutate(var = factor(var,levels=c("Time 45","Time 60","Cost 10","Cost 20","Transfers 1","Transfers 2","Time 60 - Cost 20 - Transfers 2")))) +
+  geom_errorbar(aes(ymin=ci_low,ymax=ci_high,x=group,color=City,group=interaction(City,var)),width=0.2,
+                position="identity",size=0.7,alpha=0.8,
+                data = means %>% filter(measure %in% c("ci_low","ci_high")) %>%
+                  spread(key="measure",value="ac")%>%
+              mutate(var = factor(var,levels=c("Time 45","Time 60","Cost 10","Cost 20","Transfers 1","Transfers 2","Time 60 - Cost 20 - Transfers 2")))) +
+  facet_wrap(~dimension,scales = "free",ncol = 2) +
+  scale_color_viridis_d(option="A",begin=0.3,end=0.7) +
+  scale_linetype_manual(values=c("solid","dotted")) +
+  guides(linetype = FALSE)+
+  #ylim(0,1) +
+  xlab("Social group") +
+  ylab("Average accessibility") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+ggsave("Cities/all_means_2metrics.jpeg",dpi=600,height = 6,width=8)
+
+
+## Bar plot
+ggplot() +
+  geom_bar(aes(x=group,y=ac,fill=City),
+           stat="identity",alpha=0.7,
+           position="dodge",
+           data=means %>%
+             filter(measure == "mean") %>%
+             mutate(var = factor(var,levels=c("Time 45","Time 60","Cost 10","Cost 20","Transfers 1","Transfers 2","Time 60 - Cost 20 - Transfers 2"))) %>%
+             filter(var %in% c("Time 60","Cost 20","Transfers 2","Time 60 - Cost 20 - Transfers 2"))) +
+  geom_errorbar(aes(ymin=ci_low,ymax=ci_high,x=group,color=City),
+                width=0.5,position = position_dodge(0.9),
+                size=0.6,alpha=1,
+                data = means %>% filter(measure %in% c("ci_low","ci_high")) %>%
+                  spread(key="measure",value="ac")%>%
+                  mutate(var = factor(var,levels=c("Time 45","Time 60","Cost 10","Cost 20","Transfers 1","Transfers 2","Time 60 - Cost 20 - Transfers 2"))) %>%
+                  filter(var %in% c("Time 60","Cost 20","Transfers 2","Time 60 - Cost 20 - Transfers 2"))) +
+  facet_wrap(~var,scales = "free",ncol = 2) +
+  ylim(0,0.65) +
+  scale_fill_viridis_d(option="A",begin=0.2,end=0.8)+
+  scale_color_viridis_d(option="A",begin=0.2,end=0.8)+
+  xlab("Social group") +
+  ylab("Average accessibility") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+ggsave("Cities/all_means_2metrics_barplot.jpeg",dpi=600,height = 6,width=8)
+
+## Boxplot
+access <- st_read("Cities/Sao Paulo/sp_access_cum.shp") %>%
+  st_drop_geometry() %>%
+  select("GEO_ID","hi_wh","hi_bl","md_wh","md_bl","lo_wh","lo_bl","time60","board2","cost20") %>%
+  left_join(st_read("Cities/Sao Paulo/sp_access_sim_cum.shp") %>%
+  st_drop_geometry() %>%
+  select("GEO_ID","time60_20"),by="GEO_ID") %>%
+  mutate(City = "Sao Paulo") %>%
+  rbind(st_read("Cities/London/lon_access_cum.shp") %>%
+  st_drop_geometry() %>%
+  select("GEO_ID","hi_wh","hi_bl","md_wh","md_bl","lo_wh","lo_bl","time60","board2","cost20") %>%
+  left_join(st_read("Cities/London/lon_access_sim_cum.shp") %>%
+  st_drop_geometry() %>%
+  select("GEO_ID","time60_20"),by="GEO_ID") %>%
+  mutate(City = "London"))%>%
+  rbind(st_read("Cities/NYC/nyc_access_cum.shp") %>%
+  st_drop_geometry() %>%
+  select("GEO_ID","hi_wh","hi_bl","md_wh","md_bl","lo_wh","lo_bl","time60","board2","cost20") %>%
+  left_join(st_read("Cities/NYC/nyc_access_sim_cum.shp") %>%
+  st_drop_geometry() %>%
+  select("GEO_ID","time60_20"),by="GEO_ID") %>%
+  mutate(City = "NYC"))
+
+access <- access %>% 
+  select("City","hi_wh","time60","board2","cost20","time60_20") %>%
+  expandRows("hi_wh") %>%
+  mutate(group="hi_wh") %>%
+  rbind(access %>% 
+  select("City","hi_bl","time60","board2","cost20","time60_20") %>%
+  expandRows("hi_bl") %>%
+  mutate(group="hi_bl")) %>%
+  rbind(access %>% 
+  select("City","md_wh","time60","board2","cost20","time60_20") %>%
+  expandRows("md_wh") %>%
+  mutate(group="md_wh"))%>%
+  rbind(access %>% 
+  select("City","md_bl","time60","board2","cost20","time60_20") %>%
+  expandRows("md_bl") %>%
+  mutate(group="md_bl"))%>%
+  rbind(access %>% 
+  select("City","lo_wh","time60","board2","cost20","time60_20") %>%
+  expandRows("lo_wh") %>%
+  mutate(group="lo_wh")) %>%
+  rbind(access %>% 
+  select("City","lo_bl","time60","board2","cost20","time60_20") %>%
+  expandRows("lo_bl") %>%
+  mutate(group="lo_bl"))
+access <- access %>%
+  gather(key="var",value="ac",-c(City,group))
+access$var <- ifelse(access$var == "time60_20","Time 60 - Cost 20 - Transfers 2",access$var)
+
+ggplot() +
+  geom_boxplot(aes(x=group,y=ac,fill=City),
+           data=access,outlier.shape = NA) +
+  facet_wrap(~var,ncol = 2) +
+  scale_fill_viridis_d(option="A",begin=0.2,end=0.8)+
+  scale_color_viridis_d(option="A",begin=0.2,end=0.8)+
+  xlab("Social group") +
+  ylab("Average accessibility") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+ggsave("Cities/all_means_2metrics_boxplot.jpeg",dpi=600,height = 6,width=8)
+
+
+
+```
+
+```{r access_means3races}
+
+weighted.ttest.ci <- function(x, weights, conf.level = 0.95) {
+    require(Hmisc)
+  a <- tibble(x,weights) %>% na.omit()
+  x <- a$x
+  weights <- a$weights
+    nx <- length(x)
+    df <- nx - 1
+    vx <- wtd.var(x, weights, normwt = TRUE) ## From Hmisc
+    mx <- weighted.mean(x, weights)
+    stderr <- sqrt(vx/nx)
+    tstat <- mx/stderr ## not mx - mu
+    alpha <- 1 - conf.level
+    cint <- qt(1 - alpha/2, df)
+    cint <- (tstat + c(-cint, cint))*stderr
+    cint <- c(mx,cint)
+    return(cint)}
+
+access <- st_read("Cities/Sao Paulo/sp_access_cum.shp") %>%
+  st_drop_geometry()
+access_sim <- st_read("Cities/Sao Paulo/sp_access_sim_cum.shp") %>%
+  st_drop_geometry()
+
+#Means
+means_sp <- rbind(access %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.ttest.ci(time45,.))) %>%
+                   mutate(var = "Time 45"),
+                  access %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.ttest.ci(time60,.))) %>%
+                   mutate(var = "Time 60"),
+                  access %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.ttest.ci(cost10,.))) %>%
+                   mutate(var = "Cost 10"),
+                 access %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.ttest.ci(cost20,.))) %>%
+                   mutate(var = "Cost 20"),
+                 access %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.ttest.ci(board1,.))) %>%
+                   mutate(var = "Transfers 1"),
+                 access %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.ttest.ci(board2,.))) %>%
+                   mutate(var = "Transfers 2"),
+                 access_sim %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.ttest.ci(time60_20,.))) %>%
+                   mutate(var = "Time 60 - Cost 20 - Transfers 2")) %>%
+  gather(key="group",value="ac",-c(var))
+means_sp$measure <- rep(c("mean","ci_low","ci_high"),nrow(means_sp)/3)
+
+access <- st_read("Cities/NYC/nyc_access_cum.shp") %>%
+  st_drop_geometry()
+access_sim <- st_read("Cities/NYC/nyc_access_sim_cum.shp") %>%
+  st_drop_geometry()
+
+#Means
+means_nyc <- rbind(access %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.ttest.ci(time45,.))) %>%
+                   mutate(var = "Time 45"),
+                  access %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.ttest.ci(time60,.))) %>%
+                   mutate(var = "Time 60"),
+                  access %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.ttest.ci(cost10,.))) %>%
+                   mutate(var = "Cost 10"),
+                 access %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.ttest.ci(cost20,.))) %>%
+                   mutate(var = "Cost 20"),
+                 access %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.ttest.ci(board1,.))) %>%
+                   mutate(var = "Transfers 1"),
+                 access %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.ttest.ci(board2,.))) %>%
+                   mutate(var = "Transfers 2"),
+                 access_sim %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.ttest.ci(time60_20,.))) %>%
+                   mutate(var = "Time 60 - Cost 20 - Transfers 2")) %>%
+  gather(key="group",value="ac",-c(var))
+means_nyc$measure <- rep(c("mean","ci_low","ci_high"),nrow(means_nyc)/3)
+
+access <- st_read("Cities/London/lon_access_cum.shp") %>%
+  st_drop_geometry()
+access_sim <- st_read("Cities/London/lon_access_sim_cum.shp") %>%
+  st_drop_geometry()
+
+#Means
+means_lon <- rbind(access %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.ttest.ci(time45,.))) %>%
+                   mutate(var = "Time 45"),
+                  access %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.ttest.ci(time60,.))) %>%
+                   mutate(var = "Time 60"),
+                  access %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.ttest.ci(cost10,.))) %>%
+                   mutate(var = "Cost 10"),
+                 access %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.ttest.ci(cost20,.))) %>%
+                   mutate(var = "Cost 20"),
+                 access %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.ttest.ci(board1,.))) %>%
+                   mutate(var = "Transfers 1"),
+                 access %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.ttest.ci(board2,.))) %>%
+                   mutate(var = "Transfers 2"),
+                 access_sim %>%
+                   summarise_at(c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"),
+                                ~(p = weighted.ttest.ci(time60_20,.))) %>%
+                   mutate(var = "Time 60 - Cost 20 - Transfers 2")) %>%
+  gather(key="group",value="ac",-c(var))
+means_lon$measure <- rep(c("mean","ci_low","ci_high"),nrow(means_lon)/3)
+
+
+means <- means_sp %>% mutate(City = "São Paulo") %>%
+  rbind(means_nyc %>% mutate(City = "New York City"))%>%
+  rbind(means_lon %>% mutate(City = "London"))
+means$group <- factor(means$group,levels=c("hi_wh","hi_ot","hi_bl","md_wh","md_ot","md_bl","lo_wh","lo_ot","lo_bl"))
+means$City = factor(means$City,levels=c("São Paulo","New York City","London"))
+means$group <- case_when(means$group == "hi_wh" ~ "Upper\nwhite",
+                         means$group == "hi_ot" ~ "Upper\nn-white",
+                         means$group == "hi_bl" ~ "Upper\nblack",
+                         means$group == "md_wh" ~ "Middle\nwhite",
+                         means$group == "md_ot" ~ "Middle\nn-white",
+                         means$group == "md_bl" ~ "Middle\nblack",
+                         means$group == "lo_wh" ~ "Lower\nwhite",
+                         means$group == "lo_ot" ~ "Lower\nn-white",
+                         means$group == "lo_bl" ~ "Lower\nblack")
+means$group <- factor(means$group,levels=c("Upper\nwhite","Upper\nn-white","Upper\nblack","Middle\nwhite","Middle\nn-white","Middle\nblack","Lower\nwhite","Lower\nn-white","Lower\nblack"))
+
+means$dimension <- rep(c("- - - - Time 45   ――― Time 60","- - - - Time 45   ――― Time 60","- - - - Cost 10    ――― Cost 20","- - - - Cost 10    ――― Cost 20","- - - - Transfers 1    ――― Transfers 2","- - - - Transfers 1    ――― Transfers 2","――― Time 60 + Cost 20 + Transfers 2"),each=3)
+means$dimension <- factor(means$dimension,levels = c("- - - - Time 45   ――― Time 60","- - - - Transfers 1    ――― Transfers 2","- - - - Cost 10    ――― Cost 20","――― Time 60 + Cost 20 + Transfers 2"))
+means$line <- rep(c("l1","l2",'l1',"l2","l1","l2","l2"),each=3)
+means$line <- factor(means$line,levels=c("l2","l1"))
+
+ggplot() +
+  geom_line(aes(x=group,y=ac,color=City,group=interaction(City,var),linetype=line),
+            size=1,alpha=1,
+            data=means %>%
+              filter(measure == "mean") %>%
+              mutate(var = factor(var,levels=c("Time 45","Time 60","Cost 10","Cost 20","Transfers 1","Transfers 2","Time 60 - Cost 20 - Transfers 2")))) +
+  geom_errorbar(aes(ymin=ci_low,ymax=ci_high,x=group,color=City,group=interaction(City,var)),width=0.2,
+                position="identity",size=0.7,alpha=0.8,
+                data = means %>% filter(measure %in% c("ci_low","ci_high")) %>%
+                  spread(key="measure",value="ac")%>%
+              mutate(var = factor(var,levels=c("Time 45","Time 60","Cost 10","Cost 20","Transfers 1","Transfers 2","Time 60 - Cost 20 - Transfers 2")))) +
+  facet_wrap(~dimension,scales = "free",ncol = 2) +
+  scale_color_viridis_d(option="A",begin=0.3,end=0.7) +
+  scale_linetype_manual(values=c("solid","dotted")) +
+  guides(linetype = FALSE)+
+  #ylim(0,1) +
+  xlab("Social group") +
+  ylab("Average accessibility") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+## Bar plot
+ggplot() +
+  geom_bar(aes(x=group,y=ac,fill=City),
+           stat="identity",alpha=0.7,
+           position="dodge",
+           data=means %>%
+             filter(measure == "mean") %>%
+             mutate(var = factor(var,levels=c("Time 45","Time 60","Cost 10","Cost 20","Transfers 1","Transfers 2","Time 60 - Cost 20 - Transfers 2"))) %>%
+             filter(var %in% c("Time 60","Cost 20","Transfers 2","Time 60 - Cost 20 - Transfers 2"))) +
+  geom_errorbar(aes(ymin=ci_low,ymax=ci_high,x=group,color=City),
+                width=0.5,position = position_dodge(0.9),
+                size=0.6,alpha=1,
+                data = means %>% filter(measure %in% c("ci_low","ci_high")) %>%
+                  spread(key="measure",value="ac")%>%
+                  mutate(var = factor(var,levels=c("Time 45","Time 60","Cost 10","Cost 20","Transfers 1","Transfers 2","Time 60 - Cost 20 - Transfers 2"))) %>%
+                  filter(var %in% c("Time 60","Cost 20","Transfers 2","Time 60 - Cost 20 - Transfers 2"))) +
+  facet_wrap(~var,scales = "free",ncol = 2) +
+  ylim(0,0.65) +
+  scale_fill_viridis_d(option="A",begin=0.2,end=0.8)+
+  scale_color_viridis_d(option="A",begin=0.2,end=0.8)+
+  xlab("Social group") +
+  ylab("Average accessibility") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+ggsave("Cities/all_means_2metrics3races_barplot.jpeg",dpi=600,height = 6,width=8)
+
+
+```
+
+```{r sp_PTdata}
+
+od_sp <- read.dbf("Cities/Sao Paulo/Banco de dados/OD_2017.dbf")
+
+pt_sp <- od_sp %>%
+  filter(MUNI_DOM == 36) %>%
+  filter(MOTIVO_D %in% c(1,2,3)) %>%
+  mutate(modo = case_when(MODOPRIN %in% c(1,2,3,4,5,6) ~ "TP",
+                          MODOPRIN %in% c(15,16) ~ "Ativo",
+                          MODOPRIN %in% c(9,10,13,14) ~ "Auto/Moto",
+                          TRUE ~ "Outros")) %>%
+  mutate(income = substr(100*percent_rank(RENDA_FA/NO_MORAF),1,1)) %>%
+  group_by(modo,income) %>%
+  summarise(trips = sum(FE_VIA)) %>%
+  ungroup() %>%
+  group_by(income) %>%
+  mutate(trips = trips/sum(trips,na.rm=T))
+
+
+pt_sp %>%
+  ggplot(aes(x=income,y=trips,color=modo,group=modo)) +
+  geom_line(size=1)
+
+
+
+pt_sp <- od_sp %>%
+  filter(MUNI_DOM == 36) %>%
+  filter(MOTIVO_D %in% c(1,2,3)) %>%
+  filter(MODOPRIN %in% c(1,2,3,4,5,6)) %>%
+  mutate(modo = case_when(MODOPRIN %in% c(1,2,3) ~ "Trilhos",
+                          MODOPRIN %in% c(4,5,6) ~ "Ônibus",
+                          MODOPRIN %in% c(15,16) ~ "Ativo",
+                          MODOPRIN %in% c(9,10,13,14) ~ "Auto/Moto",
+                          TRUE ~ "Outros")) %>%
+  mutate(income = substr(100*percent_rank(RENDA_FA/NO_MORAF),1,1)) %>%
+  group_by(modo,income) %>%
+  summarise(trips = sum(FE_VIA)) %>%
+  ungroup() %>%
+  group_by(income) %>%
+  mutate(trips = trips/sum(trips,na.rm=T))
+
+
+pt_sp %>%
+  ggplot(aes(x=income,y=trips,color=modo,group=modo)) +
+  geom_line(size=1)
+```
+
+```{r pop_access}
+
+sp <- st_read("Cities/Sao Paulo/sp_access_cum.shp") %>%
+  st_drop_geometry()
+
+sp %>% filter(time45 >= 0.2) %>% summarise(pop=100*sum(pop,na.rm=T)/sum(sp$pop,na.rm=T))
+
+nyc <- st_read("Cities/NYC/nyc_access_cum.shp") %>%
+  st_drop_geometry()
+
+nyc %>% filter(time45 >= 0.2) %>% summarise(pop=100*sum(pop,na.rm=T)/sum(nyc$pop,na.rm=T))
+
+
+lon <- st_read("Cities/London/lon_access_cum.shp") %>%
+  st_drop_geometry()
+
+lon %>% filter(time45 >= 0.2) %>% summarise(pop=100*sum(pop,na.rm=T)/sum(lon$pop,na.rm=T))
+
+```
+
+```{r correlations}
+
+#### Sao Paulo
+access <- st_read("Cities/Sao Paulo/sp_access_cum.shp") %>%
+  st_drop_geometry() %>%
+  mutate(Upper_class = hi_wh+hi_bl+hi_ot,
+         Middle_class = md_wh+md_bl+md_ot,
+         Lower_class = lo_wh+lo_bl+lo_ot,
+         Whites = hi_wh+md_wh+lo_wh,
+         Blacks = hi_bl+md_bl+lo_bl,
+         Non_whites = hi_ot+md_ot+lo_ot) %>%
+  select(time45,board1,cost10,Upper_class,Middle_class,Lower_class,Whites,Blacks,Non_whites)
+colnames(access) <- c("Time 45","Transfers 1","Cost 10","Upper class","Middle class","Lower class","Whites","Blacks","Non-whites")
+
+res_sp <- rcorr(as.matrix(access))
+png(height=1800, width=1800, file="Cities/Sao Paulo/Plots/cor_sp.png", type = "cairo")
+corrplot(res_sp$r, order="original",p.mat = res_sp$P, sig.level = 0.05, insig = "blank",tl.col = "black",method="circle",tl.cex =4,cl.cex = 3)
+dev.off()
+
+#### NYC
+access <- st_read("Cities/NYC/nyc_access_cum.shp") %>%
+  st_drop_geometry() %>%
+  mutate(Upper_class = hi_wh+hi_bl+hi_ot,
+         Middle_class = md_wh+md_bl+md_ot,
+         Lower_class = lo_wh+lo_bl+lo_ot,
+         Whites = hi_wh+md_wh+lo_wh,
+         Blacks = hi_bl+md_bl+lo_bl,
+         Non_whites = hi_ot+md_ot+lo_ot)  %>%
+  select(time45,board1,cost10,Upper_class,Middle_class,Lower_class,Whites,Blacks,Non_whites)
+colnames(access) <- c("Time 45","Transfers 1","Cost 10","Upper class","Middle class","Lower class","Whites","Blacks","Non-whites")
+
+res_sp <- rcorr(as.matrix(access))
+png(height=1800, width=1800, file="Cities/NYC/Plots/cor_nyc.png", type = "cairo")
+corrplot(res_sp$r, order="original",p.mat = res_sp$P, sig.level = 0.05, insig = "blank",tl.col = "black",method="circle",tl.cex =4,cl.cex = 3)
+dev.off()
+
+#### London
+access <- st_read("Cities/London/lon_access_cum.shp") %>%
+  st_drop_geometry() %>%
+  mutate(Upper_class = hi_wh+hi_bl+hi_ot,
+         Middle_class = md_wh+md_bl+md_ot,
+         Lower_class = lo_wh+lo_bl+lo_ot,
+         Whites = hi_wh+md_wh+lo_wh,
+         Blacks = hi_bl+md_bl+lo_bl,
+         Non_whites = hi_ot+md_ot+lo_ot) %>%
+  select(time45,board1,cost10,Upper_class,Middle_class,Lower_class,Whites,Blacks,Non_whites)
+colnames(access) <- c("Time 45","Transfers 1","Cost 10","Upper class","Middle class","Lower class","Whites","Blacks","Non-whites")
+
+res_sp <- rcorr(as.matrix(access))
+png(height=1800, width=1800, file="Cities/London/Plots/cor_lon.png", type = "cairo")
+corrplot(res_sp$r, order="original",p.mat = res_sp$P, sig.level = 0.05, insig = "blank",tl.col = "black",method="circle",tl.cex =4,cl.cex = 3)
+dev.off()
+```
+
+```{r access_inequalities}
+access <- st_read("Cities/Sao Paulo/sp_access_cum.shp") %>%
+  st_drop_geometry() %>%
+  select("GEO_ID","pop","hi_wh","hi_bl","md_wh","md_bl","lo_wh","lo_bl","time30","time45","time60","time90","board0","board1","board2","cost10","cost20","cost30","cost40") %>%
+  mutate(City = "Sao Paulo") %>%
+  rbind(st_read("Cities/London/lon_access_cum.shp") %>%
+  st_drop_geometry() %>%
+  select("GEO_ID","pop","hi_wh","hi_bl","md_wh","md_bl","lo_wh","lo_bl","time30","time45","time60","time90","board0","board1","board2","cost10","cost20","cost30","cost40") %>%
+  mutate(City = "London"))%>%
+  rbind(st_read("Cities/NYC/nyc_access_cum.shp") %>%
+  st_drop_geometry() %>%
+  select("GEO_ID","pop","hi_wh","hi_bl","md_wh","md_bl","lo_wh","lo_bl","time30","time45","time60","time90","board0","board1","board2","cost10","cost20","cost30","cost40") %>%
+  mutate(City = "NYC"))
+
+
+gini <- access %>% 
+  filter(pop>0) %>%
+  group_by(City) %>%
+  summarise_at(c("time30","time45","time60","time90","board0","board1","board2","cost10","cost20","cost30","cost40"),~(p=ineq::Gini(.,pop,na.rm = T)))
+gini <- gini %>% 
+  gather(key="var",value="gini",-c(City)) %>%
+  mutate(dim = case_when(var %in% c("time30","time45","time60","time90") ~ "Time",
+                                        var %in% c("board0","board1","board2") ~ "Transfer",
+                                        var %in% c("cost10","cost20","cost30","cost40") ~ "Cost"))
+gini$dim <- factor(gini$dim,levels=c("Time","Transfer","Cost"))
+gini$var <- factor(gini$var,levels=rev(c("time30","time45","time60","time90","board0","board1","board2","cost10","cost20","cost30","cost40")))
+gini$City <- factor(gini$City,levels=c("Sao Paulo","NYC","London"),labels=c("São Paulo","New York City","London"))
+
+rel <- (access %>% 
+  filter(pop>0) %>%
+  group_by(City) %>%
+  summarise_at(c("time30","time45","time60","time90","board0","board1","board2","cost10","cost20","cost30","cost40"),~(up=sum(.*hi_wh,na.rm = T)/sum(hi_wh,na.rm=T))) %>%
+    mutate(Group = "hi_wh")) %>%
+  rbind(access %>% 
+  filter(pop>0) %>%
+  group_by(City) %>%
+  summarise_at(c("time30","time45","time60","time90","board0","board1","board2","cost10","cost20","cost30","cost40"),~(low=sum(.*lo_bl,na.rm = T)/sum(lo_bl,na.rm=T)))%>%
+    mutate(Group = "lo_bl")) %>%
+  group_by(City) %>%
+  summarise_at(c("time30","time45","time60","time90","board0","board1","board2","cost10","cost20","cost30","cost40"),~(rel=max(.)/min(.))) %>% 
+  gather(key="var",value="rel",-c(City)) %>%
+  mutate(dim = case_when(var %in% c("time30","time45","time60","time90") ~ "Time",
+                                        var %in% c("board0","board1","board2") ~ "Transfer",
+                                        var %in% c("cost10","cost20","cost30","cost40") ~ "Cost"))
+
+rel$var <- factor(rel$var,levels=rev(c("time30","time45","time60","time90","board0","board1","board2","cost10","cost20","cost30","cost40")))
+rel$dim <- factor(rel$dim,levels=c("Time","Transfer","Cost"))
+rel$City <- factor(rel$City,levels=c("Sao Paulo","NYC","London"),labels=c("São Paulo","New York City","London"))
+
+```
+
+```{r ineq_graph}
+
+# Plot
+ggplot(gini) +
+  geom_point(aes(x=var,y=gini,color=City),size=3,alpha=0.8) +
+  scale_color_viridis_d(option="A",begin=0.2,end=0.8)+
+  coord_flip()+
+  theme_minimal() +
+  facet_wrap(~dim,ncol = 3,scales = "free") +
+  xlab("") +
+  ylab("Gini") +
+  theme(legend.position = "bottom")
+ggsave("Cities/gini.jpeg",dpi=600,height = 4,width=8)
+
+# Plot
+ggplot(rel) +
+  geom_point(aes(x=var,y=rel,color=City),size=3,alpha=0.8) +
+  scale_color_viridis_d(option="A",begin=0.2,end=0.8)+
+  coord_flip()+
+  theme_minimal() +
+  facet_wrap(~dim,ncol = 3,scales="free") +
+  xlab("") +
+  ylab("White upper class / Black lower class") +
+  theme(legend.position = "bottom")
+ggsave("Cities/relative.jpeg",dpi=600,height = 4,width=8)
+
+```
+
+
+# Extras
+
+```{r income}
+
+# Gini income
+ineq::Gini(rep(wa_sp$pc_inc,wa_sp$weight),na.rm=T)
+ineq::Gini(rep(wa_nyc$pc_inc,wa_nyc$weight),na.rm=T)
+
+inc <- wa_sp %>%
+  select(so_group,pc_inc,weight) %>%
+  filter(so_group %in% c("hi_wh","hi_bl","md_wh","md_bl","lo_wh","lo_bl")) %>%
+  expandRows("weight") %>%
+  mutate(city = "SP") %>%
+  rbind(wa_nyc %>%
+          select(so_group,pc_inc,weight) %>%
+          filter(so_group %in% c("hi_wh","hi_bl","md_wh","md_bl","lo_wh","lo_bl")) %>%
+          expandRows("weight") %>%
+          mutate(city = "NYC"))  %>%
+  mutate(so_group = factor(so_group,levels = c("hi_wh","hi_bl","md_wh","md_bl","lo_wh","lo_bl"),
+                           labels = c("Upper class\nwhite","Upper class\nblack",
+                                      "Middle class\nwhite","Middle class\nblack",
+                                      "Lower class\nwhite","Lower class\nblack"))) %>%
+  mutate(pc_inc_mw = ifelse(city == "SP",pc_inc/51.95,pc_inc/58)) %>%
+  na.omit()
+
+inc  %>%
+  ggplot(aes(x=so_group,y=pc_inc_mw,color=city)) +
+  geom_boxplot(outlier.shape=NA) +
+  ylim(0,6) +
+  xlab("Social group") +
+  ylab("Per capita income (in minimal wages)") +
+  theme_minimal()
+
+```
+
+```{r groups_pop}
+
+aux2 <- wa_nyc %>% group_by(so_group) %>% filter(so_group %in% c("hi_wh","hi_bl","md_wh","md_bl","lo_wh","lo_bl")) %>%
+  summarise(NYC = sum(weight)) %>%
+  ungroup() %>%
+  mutate(NYC = 100*NYC/sum(NYC))
+
+aux1 <- wa_sp %>% group_by(so_group) %>% filter(so_group %in% c("hi_wh","hi_bl","md_wh","md_bl","lo_wh","lo_bl")) %>%
+  summarise(SP = sum(weight)) %>%
+  ungroup() %>%
+  mutate(SP = 100*SP/sum(SP))
+  
+aux1 %>% left_join(aux2,by="so_group") %>%
+  mutate(so_group = factor(so_group,levels = c("hi_wh","hi_bl","md_wh","md_bl","lo_wh","lo_bl"))) %>%
+  arrange(so_group)
+
+```
+
+```{r}
+
+#SP
+files <- list.files("Cities/Sao Paulo/outputs/",full.names = T)
+sp <- NULL
+for(i in files){
+  df <- readRDS(i)
+  if("agencyName" %in% colnames(df)){
+    df <- df %>%
+    group_by(fromPlace,toPlace) %>%
+    summarise(transitTime = sum(transitTime,na.rm=T),
+              waitingTime = sum(waitingTime,na.rm=T),
+              walkTime = sum(walkTime,na.rm=T)) %>%
+    ungroup()
+    sp <- rbind(sp,df)} 
+}
+
+#NYC
+files <- list.files("Cities/NYC/outputs/",full.names = T)
+nyc <- NULL
+for(i in files){
+  df <- readRDS(i)
+  if("agencyName" %in% colnames(df)){
+    df <- df %>%
+    group_by(fromPlace,toPlace) %>%
+    summarise(transitTime = sum(transitTime,na.rm=T),
+              waitingTime = sum(waitingTime,na.rm=T),
+              walkTime = sum(walkTime,na.rm=T)) %>%
+    ungroup()
+    nyc <- rbind(nyc,df)} 
+}
+
+#LON
+files <- list.files("OTP/LON/outputs/",full.names = T)
+lon <- NULL
+for(i in files){
+  df <- readRDS(i)
+  if("agencyName" %in% colnames(df)){
+    df <- df %>%
+    group_by(fromPlace,toPlace) %>%
+    summarise(transitTime = sum(transitTime,na.rm=T),
+              waitingTime = sum(waitingTime,na.rm=T),
+              walkTime = sum(walkTime,na.rm=T)) %>%
+    ungroup()
+    lon <- rbind(lon,df)} 
+}
+
+df <- rbind(sp %>% mutate(city = "SP") %>% filter(toPlace == 8326),
+            nyc %>% mutate(city = "NYC") %>% filter(toPlace == 264),
+            lon %>% mutate(city = "LON") %>% filter(toPlace == 259))
+
+
+df %>% group_by(city) %>%
+  summarise(transitTime = mean(transitTime,na.rm=T)/60,
+              waitingTime = mean(waitingTime,na.rm=T)/60,
+              walkTime = mean(walkTime,na.rm=T)/60,
+            waiting_transit = mean(waitingTime/transitTime,na.rm=T))
+```
+
+```{r}
+
+sp <- st_read("Cities/Sao Paulo/sp_access_cum.shp") %>%
+  st_drop_geometry()
+
+sp %>% summarise(access=weighted.mean(cost40,lo_bl,na.rm=T))
+
+```
+
+
+```{r}
+
+ac <-  st_read("Cities/Sao Paulo/sp_access_cum.shp") %>%
+  st_drop_geometry() %>%
+  filter(!is.na(time30)) %>%
+  select(GEO_ID) %>%
+  unlist()
+
+sp700 <- read_csv("Cities/Sao Paulo/otp_output.csv") %>%
+  mutate(od = paste0(fromPlace,"-",toPlace)) %>%
+  mutate(time=time/60) %>%
+  select(fromPlace,toPlace,od,time,transfers)
+colnames(sp700) <- c("origin","destination","od","time700","transf700")
+sp715 <- read_csv("OTP/SP_bus-rail/sp_traveltime_matrix_715.csv") %>%
+  mutate(od = paste0(origin,"-",destination)) %>%
+  mutate(travel_time=travel_time/60) %>%
+  select(od,travel_time,boardings)
+colnames(sp715) <- c("od","time715","transf715")
+sp730 <- read_csv("OTP/SP_bus-rail/sp_traveltime_matrix_730.csv")%>%
+  mutate(od = paste0(origin,"-",destination)) %>%
+  mutate(travel_time=travel_time/60) %>%
+  select(od,travel_time,boardings)
+colnames(sp730) <- c("od","time730","transf730")
+
+sp <- sp700 %>% left_join(sp715,by="od") %>% left_join(sp730,by="od") %>% na.omit() %>%
+  mutate(m_time = (time700 + time715 + time730)/3,
+         m_transf = (transf700 + transf715 + transf730)/3) %>%
+  mutate(v_time = 100*(time700 - m_time)/m_time,
+         v_transf = 100*(transf700 - m_transf)/m_transf) %>%
+  filter(origin %in% ac & destination %in% ac)
+summary(sp)
+
+
+sp700 <- read_csv("Cities/NYC/nyc_otp_output.csv") %>%
+  mutate(od = paste0(fromPlace,"-",toPlace)) %>%
+  mutate(time=time/60) %>%
+  select(od,time,transfers)
+colnames(sp700) <- c("od","time700","transf700")
+sp715 <- read_csv("OTP/NYC/nyc_traveltime_matrix_715.csv") %>%
+  mutate(od = paste0(origin,"-",destination)) %>%
+  mutate(travel_time=travel_time/60) %>%
+  select(od,travel_time,boardings)
+colnames(sp715) <- c("od","time715","transf715")
+sp730 <- read_csv("OTP/NYC/nyc_traveltime_matrix_730.csv")%>%
+  mutate(od = paste0(origin,"-",destination)) %>%
+  mutate(travel_time=travel_time/60) %>%
+  select(od,travel_time,boardings)
+colnames(sp730) <- c("od","time730","transf730")
+
+nyc <- sp700 %>% left_join(sp715,by="od") %>% left_join(sp730,by="od") %>% na.omit() %>%
+  mutate(m_time = (time700 + time715 + time730)/3,
+         m_transf = (transf700 + transf715 + transf730)/3) %>%
+  mutate(v_time = 100*(time700 - m_time)/m_time,
+         v_transf = 100*(transf700 - m_transf)/m_transf)
+summary(nyc)
+
+
+
+```
+
